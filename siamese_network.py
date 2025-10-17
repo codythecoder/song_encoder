@@ -24,13 +24,24 @@ the class segmentation of the training inputs.
 ## Setup
 """
 
+print('importing')
 import random
-import numpy as np
+from typing import Optional
+
 import keras
 from keras import ops
-import matplotlib.pyplot as plt
+from keras import layers
 
+import numpy as np
 from numpy import typing as npt
+
+import matplotlib.pyplot as plt
+import tensorflow as tf
+
+
+import matplotlib.pyplot as plt
+from PIL import Image
+
 
 #
 # Hyperparameters
@@ -42,24 +53,57 @@ MARGIN = 1  # Margin for contrastive loss.
 LATENT_SPACE = 10
 IMAGE_SIZE = 28, 28
 
-#
-# Load the MNIST dataset
-#
-(x_train_val, y_train_val), (x_test, y_test) = keras.datasets.mnist.load_data()
-
-# Change the data type to a floating point format
-x_train_val = x_train_val.astype("float32")
-x_test = x_test.astype("float32")
 
 
-#
-# Define training and validation sets
-#
+class PatchScanner(layers.Layer):
+    def __init__(
+            self,
+            patch_width: int,
+            sample_image: keras.KerasTensor,
+            output_size: int | None,
+            strides: Optional[int | tuple[int, int]] = None,
+            layers: int = 1,
+            **kwargs):
+        super().__init__(**kwargs)
+        sample_image_size: tuple[int, int, int] = (
+            sample_image.shape[1], # type: ignore
+            sample_image.shape[2],
+            sample_image.shape[3] if len(sample_image.shape) >= 4 else 1
+        )  # type: ignore
+        self.patch_size = (sample_image_size[0], patch_width)
+        self.strides = strides
+        self.layers = layers
+        self.output_height: int = output_size or sample_image_size[0]
 
-# Keep 50% of train_val  in validation set
-x_train, x_val = x_train_val[:30000], x_train_val[30000:]
-y_train, y_val = y_train_val[:30000], y_train_val[30000:]
-del x_train_val, y_train_val
+
+        input = keras.layers.Input((*self.patch_size, sample_image_size[2]))
+        dense = keras.layers.Flatten()(input)
+        dense = keras.layers.Dense(self.output_height*self.layers)(dense)
+        self.embedding_network = keras.Model(input, dense)
+
+    def call(self, x: keras.KerasTensor):
+        # create patch virtulisation
+        patches = keras.ops.image.extract_patches(x, self.patch_size, strides=self.strides)
+        batch_size = keras.ops.shape(patches)[0]
+        num_patches = keras.ops.shape(patches)[1] * keras.ops.shape(patches)[2]
+        num_dims = x.shape[-1]
+        patches = keras.ops.reshape(patches, (batch_size, num_patches, *self.patch_size, num_dims))
+        patches = keras.ops.transpose(patches, axes=(0, 2, 3, 4, 1))
+
+        # fully connected layer factory
+        y: list[tf.Tensor] = keras.ops.unstack(
+            patches, num=None, axis=-1
+        ) # type: ignore
+
+        outputs = [
+            layers.Reshape((self.output_height, 1, self.layers))(self.embedding_network(layer))
+            for layer in y
+        ]
+
+        output = layers.Concatenate(2)(outputs)
+
+        return output
+
 
 
 #
@@ -120,52 +164,6 @@ def make_pairs(x, y):
     return np.array(pairs), np.array(labels).astype("float32")
 
 
-# make train pairs
-pairs_train, labels_train = make_pairs(x_train, y_train)
-
-# make validation pairs
-pairs_val, labels_val = make_pairs(x_val, y_val)
-
-# make test pairs
-pairs_test, labels_test = make_pairs(x_test, y_test)
-
-"""
-We get:
-
-**pairs_train.shape = (60000, 2, *IMAGE_SIZE)**
-
-- We have 60,000 pairs
-- Each pair contains 2 images
-- Each image has shape `(*IMAGE_SIZE)`
-"""
-
-"""
-Split the training pairs
-"""
-
-x_train_1 = pairs_train[:, 0]  # x_train_1.shape is (60000, *IMAGE_SIZE)
-x_train_2 = pairs_train[:, 1]
-
-"""
-Split the validation pairs
-"""
-
-x_val_1 = pairs_val[:, 0]  # x_val_1.shape = (60000, *IMAGE_SIZE)
-x_val_2 = pairs_val[:, 1]
-
-"""
-Split the test pairs
-"""
-
-x_test_1 = pairs_test[:, 0]  # x_test_1.shape = (20000, *IMAGE_SIZE)
-x_test_2 = pairs_test[:, 1]
-
-
-"""
-## Visualize pairs and their labels
-"""
-
-
 def visualize(
         pairs: npt.NDArray,
         labels: npt.NDArray,
@@ -224,7 +222,7 @@ def visualize(
 
         ax.imshow(ops.concatenate([pairs[i][0], pairs[i][1]], axis=1), cmap="gray")
         ax.set_axis_off()
-        if predictions:
+        if predictions is not None:
             ax.set_title("True: {} | Pred: {:.5f}".format(labels[i], predictions[i][0]))
         else:
             ax.set_title("Label: {}".format(labels[i]))
@@ -233,6 +231,136 @@ def visualize(
     else:
         plt.tight_layout(rect=(0, 0, 1.5, 1.5))
     plt.show()
+
+
+# Provided two tensors t1 and t2
+# Euclidean distance = sqrt(sum(square(t1-t2)))
+def euclidean_distance(vects):
+    """Find the Euclidean distance between two vectors.
+
+    Arguments:
+        vects: List containing two tensors of same length.
+
+    Returns:
+        Tensor containing euclidean distance
+        (as floating point value) between vectors.
+    """
+
+    x, y = vects
+    sum_square = ops.sum(ops.square(x - y), axis=1, keepdims=True)
+    return ops.sqrt(ops.maximum(sum_square, keras.backend.epsilon()))
+
+
+print('loading dataset')
+#
+# Load the MNIST dataset
+#
+(x_train_val, y_train_val), (x_test, y_test) = keras.datasets.mnist.load_data()
+
+# Change the data type to a floating point format
+x_train_val = x_train_val.astype("float32")
+x_test = x_test.astype("float32")
+
+
+#
+# Define training and validation sets
+#
+
+# Keep 50% of train_val  in validation set
+x_train, x_val = x_train_val[:30000], x_train_val[30000:]
+y_train, y_val = y_train_val[:30000], y_train_val[30000:]
+del x_train_val, y_train_val
+
+
+
+
+# print('testing patches')
+
+# PATCH_SHAPE = 36, 9
+# IMAGE_SIZE = 36, 36
+# BATCH_SIZE = 2
+# COLOR_CHANNELS = 3
+
+# images = [
+#     Image.open(r'C:\Users\cody.lovett\OneDrive - AC3\Pictures\temp1.png'),
+#     Image.open(r'C:\Users\cody.lovett\OneDrive - AC3\Pictures\temp2.png'),
+# ]
+
+# first_array=np.reshape(images[:BATCH_SIZE], (BATCH_SIZE, *IMAGE_SIZE, 3))
+# first_array = first_array.astype("float32")/255
+
+# patches = keras.ops.image.extract_patches(first_array, PATCH_SHAPE, padding='valid')
+
+# num_patches = keras.ops.shape(patches)[1] * keras.ops.shape(patches)[2]
+# patch_dim = keras.ops.shape(patches)[3]
+
+# out = keras.ops.reshape(patches, (BATCH_SIZE, num_patches, *PATCH_SHAPE, COLOR_CHANNELS))
+# # out = keras.ops.transpose(out, axes=(0, 2, 3, 4, 1))
+
+# f, axarr = plt.subplots(1,4)
+
+# # axarr[0].imshow(out[0,:,:,:,0])
+# # axarr[1].imshow(out[0,:,:,:,1])
+# # axarr[2].imshow(out[0,:,:,:,2])
+# # axarr[3].imshow(out[0,:,:,:,3])
+# axarr[0].imshow(out[0,0])
+# axarr[1].imshow(out[0,1])
+# axarr[2].imshow(out[0,2])
+# axarr[3].imshow(out[0,3])
+
+# #Actually displaying the plot if you are not in interactive mode
+# plt.show()
+# # input()
+
+
+
+
+
+
+# make train pairs
+pairs_train, labels_train = make_pairs(x_train, y_train)
+
+# make validation pairs
+pairs_val, labels_val = make_pairs(x_val, y_val)
+
+# make test pairs
+pairs_test, labels_test = make_pairs(x_test, y_test)
+
+"""
+We get:
+
+**pairs_train.shape = (60000, 2, *IMAGE_SIZE)**
+
+- We have 60,000 pairs
+- Each pair contains 2 images
+- Each image has shape `(*IMAGE_SIZE)`
+"""
+
+"""
+Split the training pairs
+"""
+
+x_train_1 = pairs_train[:, 0]  # x_train_1.shape is (60000, *IMAGE_SIZE)
+x_train_2 = pairs_train[:, 1]
+
+"""
+Split the validation pairs
+"""
+
+x_val_1 = pairs_val[:, 0]  # x_val_1.shape = (60000, *IMAGE_SIZE)
+x_val_2 = pairs_val[:, 1]
+
+"""
+Split the test pairs
+"""
+
+x_test_1 = pairs_test[:, 0]  # x_test_1.shape = (20000, *IMAGE_SIZE)
+x_test_2 = pairs_test[:, 1]
+
+
+"""
+## Visualize pairs and their labels
+"""
 
 
 """
@@ -263,30 +391,14 @@ merged output is fed to the final network.
 """
 
 
-# Provided two tensors t1 and t2
-# Euclidean distance = sqrt(sum(square(t1-t2)))
-def euclidean_distance(vects):
-    """Find the Euclidean distance between two vectors.
-
-    Arguments:
-        vects: List containing two tensors of same length.
-
-    Returns:
-        Tensor containing euclidean distance
-        (as floating point value) between vectors.
-    """
-
-    x, y = vects
-    sum_square = ops.sum(ops.square(x - y), axis=1, keepdims=True)
-    return ops.sqrt(ops.maximum(sum_square, keras.backend.epsilon()))
-
-
 input = keras.layers.Input((*IMAGE_SIZE, 1))
 x = keras.layers.BatchNormalization()(input)
-x = keras.layers.Conv2D(4, (5, 5), activation="tanh")(x)
-x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
-x = keras.layers.Conv2D(16, (5, 5), activation="tanh")(x)
-x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
+x = PatchScanner(4, x, strides=1, layers=3, output_size=IMAGE_SIZE[0]-5)(x)
+x = PatchScanner(4, x, strides=2, layers=5, output_size=IMAGE_SIZE[0]-15)(x)
+x = PatchScanner(4, x, strides=1, layers=10, output_size=IMAGE_SIZE[0]-15)(x)
+# x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
+# x = keras.layers.Conv2D(16, (5, 5), activation="tanh")(x)
+# x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
 x = keras.layers.Flatten()(x)
 
 x = keras.layers.BatchNormalization()(x)
