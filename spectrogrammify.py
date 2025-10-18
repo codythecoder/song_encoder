@@ -1,13 +1,8 @@
 from typing import Optional
-import matplotlib.pyplot as plt
 from scipy import signal
 import numpy as np
 from scipy.io import wavfile
 
-# filepath = r'C:\Users\cody.lovett\Music\Patricia Taxxon - TECHDOG 1-7\Patricia Taxxon - TECHDOG 1-7 - 36 GDGEGDGCDEDHECETCHCOHTHOTOTO.mp3'
-# filepath = r'C:\Users\cody.lovett\Music\dgh06 (Some other sort of House) [Projectfile](1).wav'
-# filepath = r'C:\Users\cody.lovett\Music\Julian Gray feat. SOFI - Revolver (Edge Split Remix) v2.wav'
-filepath = r'C:\Users\cody.lovett\Music\13. rain mist, snow mist, fire that follows-v04.wav'
 
 def spectrogrammify(
         filepath: str,
@@ -31,19 +26,22 @@ def spectrogrammify(
 
     frequencies, times, spectrogram = signal.spectrogram(samples, sample_rate, nperseg=nperseg, nfft=nfft, noverlap=noverlap, scaling='spectrum')
 
-    print(
-        nperseg,
-        nfft,
-        noverlap,
-        len(frequencies),
-        f'{len(times)/(len(samples)/sample_rate):.2f}'
-    )
+    print(f'{nperseg=}')
+    print(f'{nfft=}')
+    print(f'{noverlap=}')
+    print(f'{len(frequencies)=}')
+    print(f'{len(samples)=}')
+    print(f'{len(times)=}')
+    print(f'{sample_rate=}')
+    print(f'samples_per_second={len(times)/(len(samples)/sample_rate):.2f}')
 
     return frequencies, times[1:], spectrogram[:,1:]
 
 
 
 if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+    filepath = r'13. rain mist, snow mist, fire that follows-v04.wav'
     frequencies, times, spectrogram = spectrogrammify(filepath, nperseg=1024)
     times = times[:1000]
     spectrogram = spectrogram[:,:1000]

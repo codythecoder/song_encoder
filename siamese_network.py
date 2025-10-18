@@ -25,6 +25,7 @@ the class segmentation of the training inputs.
 """
 
 print('importing')
+import os
 import random
 from typing import Optional
 
@@ -42,6 +43,8 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from PIL import Image
 
+from spectrogrammify import spectrogrammify
+
 
 #
 # Hyperparameters
@@ -51,7 +54,8 @@ EPOCHS = 10
 BATCH_SIZE = 16
 MARGIN = 1  # Margin for contrastive loss.
 LATENT_SPACE = 10
-IMAGE_SIZE = 28, 28
+# IMAGE_SIZE = 28, 28
+IMAGE_SIZE = 129, 413
 
 
 
@@ -251,11 +255,52 @@ def euclidean_distance(vects):
     return ops.sqrt(ops.maximum(sum_square, keras.backend.epsilon()))
 
 
+def load_data(nperseg=256, seg_length=1500, data_length=44100*12):
+    seg_length = (seg_length // nperseg) * nperseg
+    data_length = (data_length // seg_length)
+
+    folderpath = r'data'
+    filenames = [
+        '13. rain mist, snow mist, fire that follows-v04.wav',
+        'Julian Gray feat. SOFI - Revolver (Edge Split Remix) v2.wav'
+    ]
+
+    pairs: list[tuple[npt.NDArray, int]] = []
+    for i, filename in enumerate(filenames):
+        spectrogram: npt.NDArray
+        frequencies, times, spectrogram = spectrogrammify(os.path.join(folderpath, filename), nperseg=256)
+        spectrogram = np.array([
+            spectrogram[:,j*5:j*5+5].mean(axis=1)
+            for j in range(len(spectrogram[0])//5)
+        ]).transpose((1, 0))
+        pairs.extend(
+            (spectrogram[:,j:j+data_length], i)
+            for j in range(spectrogram.shape[1] - data_length)
+        )
+
+    # random.shuffle(pairs)
+    split_index = int(len(pairs)*0.8)
+    train_x = np.array([pairs[i][0] for i in range(split_index)])
+    train_y = np.array([pairs[i][1] for i in range(split_index)])
+    pairs = pairs[split_index:]
+    return (
+        (
+            train_x,
+            train_y,
+        ),
+        (
+            np.array([pairs[i][0] for i in range(len(pairs))]),
+            np.array([pairs[i][1] for i in range(len(pairs))]),
+        ),
+    )
+
 print('loading dataset')
 #
 # Load the MNIST dataset
 #
-(x_train_val, y_train_val), (x_test, y_test) = keras.datasets.mnist.load_data()
+# (x_train_val, y_train_val), (x_test, y_test) = keras.datasets.mnist.load_data()
+(x_train_val, y_train_val), (x_test, y_test) = load_data()
+print('formatting data')
 
 # Change the data type to a floating point format
 x_train_val = x_train_val.astype("float32")
@@ -282,8 +327,8 @@ del x_train_val, y_train_val
 # COLOR_CHANNELS = 3
 
 # images = [
-#     Image.open(r'C:\Users\cody.lovett\OneDrive - AC3\Pictures\temp1.png'),
-#     Image.open(r'C:\Users\cody.lovett\OneDrive - AC3\Pictures\temp2.png'),
+#     Image.open(r'temp1.png'),
+#     Image.open(r'temp2.png'),
 # ]
 
 # first_array=np.reshape(images[:BATCH_SIZE], (BATCH_SIZE, *IMAGE_SIZE, 3))
@@ -321,7 +366,7 @@ del x_train_val, y_train_val
 pairs_train, labels_train = make_pairs(x_train, y_train)
 
 # make validation pairs
-pairs_val, labels_val = make_pairs(x_val, y_val)
+# pairs_val, labels_val = make_pairs(x_val, y_val)
 
 # make test pairs
 pairs_test, labels_test = make_pairs(x_test, y_test)
@@ -347,8 +392,8 @@ x_train_2 = pairs_train[:, 1]
 Split the validation pairs
 """
 
-x_val_1 = pairs_val[:, 0]  # x_val_1.shape = (60000, *IMAGE_SIZE)
-x_val_2 = pairs_val[:, 1]
+# x_val_1 = pairs_val[:, 0]  # x_val_1.shape = (60000, *IMAGE_SIZE)
+# x_val_2 = pairs_val[:, 1]
 
 """
 Split the test pairs
@@ -367,19 +412,19 @@ x_test_2 = pairs_test[:, 1]
 Inspect training pairs
 """
 
-visualize(pairs_train[:-1], labels_train[:-1], to_show=4, num_col=4)
+# visualize(pairs_train[:-1], labels_train[:-1], to_show=4, num_col=4)
 
 """
 Inspect validation pairs
 """
 
-visualize(pairs_val[:-1], labels_val[:-1], to_show=4, num_col=4)
+# visualize(pairs_val[:-1], labels_val[:-1], to_show=4, num_col=4)
 
 """
 Inspect test pairs
 """
 
-visualize(pairs_test[:-1], labels_test[:-1], to_show=4, num_col=4)
+# visualize(pairs_test[:-1], labels_test[:-1], to_show=4, num_col=4)
 
 """
 ## Define the model
@@ -393,9 +438,9 @@ merged output is fed to the final network.
 
 input = keras.layers.Input((*IMAGE_SIZE, 1))
 x = keras.layers.BatchNormalization()(input)
-x = PatchScanner(4, x, strides=1, layers=3, output_size=IMAGE_SIZE[0]-5)(x)
-x = PatchScanner(4, x, strides=2, layers=5, output_size=IMAGE_SIZE[0]-15)(x)
-x = PatchScanner(4, x, strides=1, layers=10, output_size=IMAGE_SIZE[0]-15)(x)
+x = PatchScanner(4, x, strides=1, layers=3, output_size=IMAGE_SIZE[0]//2)(x)
+x = PatchScanner(4, x, strides=2, layers=5, output_size=IMAGE_SIZE[0]//4)(x)
+x = PatchScanner(4, x, strides=1, layers=10, output_size=IMAGE_SIZE[0]//8)(x)
 # x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
 # x = keras.layers.Conv2D(16, (5, 5), activation="tanh")(x)
 # x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
@@ -475,10 +520,12 @@ siamese.summary()
 history = siamese.fit(
     [x_train_1, x_train_2],
     labels_train,
-    validation_data=([x_val_1, x_val_2], labels_val),
+    validation_data=([x_test_1, x_test_2], labels_test),
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
 )
+
+history.save('out.keras')
 
 """
 ## Visualize results
