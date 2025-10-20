@@ -306,6 +306,46 @@ def load_data(
         ),
     )
 
+
+"""
+## Define the contrastive Loss
+"""
+
+
+def loss(margin: float = 1) -> Callable:
+    """Provides 'contrastive_loss' an enclosing scope with variable 'margin'.
+
+    Arguments:
+        margin: Integer, defines the baseline for distance for which pairs
+                should be classified as dissimilar. - (default is 1).
+
+    Returns:
+        'contrastive_loss' function with data ('margin') attached.
+    """
+
+    # Contrastive loss = mean( (1-true_value) * square(prediction) +
+    #                         true_value * square( max(margin-prediction, 0) ))
+    def contrastive_loss(
+            y_true: npt.NDArray[np.float32],
+            y_pred: npt.NDArray[np.float32]
+            ) -> Any:
+        """Calculates the contrastive loss.
+
+        Arguments:
+            y_true: List of labels, each label is of type float32.
+            y_pred: List of predictions of same length as of y_true,
+                    each label is of type float32.
+
+        Returns:
+            A tensor containing contrastive loss as floating point value.
+        """
+
+        square_pred = ops.square(y_pred)
+        margin_square = ops.square(ops.maximum(margin - (y_pred), 0))
+        return ops.mean((1 - y_true) * square_pred + (y_true) * margin_square)
+
+    return contrastive_loss
+
 print('loading dataset')
 #
 # Load the MNIST dataset
@@ -453,16 +493,21 @@ merged output is fed to the final network.
 IMAGE_SIZE = x_test_1.shape[1:]
 input = keras.layers.Input((*IMAGE_SIZE, 1))
 x = keras.layers.BatchNormalization()(input)
-x = PatchScanner(4, x, strides=1, layers=3, output_size=IMAGE_SIZE[0]//2)(x)
-x = PatchScanner(4, x, strides=2, layers=5, output_size=IMAGE_SIZE[0]//4)(x)
-x = PatchScanner(4, x, strides=1, layers=10, output_size=IMAGE_SIZE[0]//8)(x)
+x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
+x = PatchScanner(6, x.shape, strides=6, layers=2, output_size=IMAGE_SIZE[0]//2)(x)
+x = PatchScanner(4, x.shape, strides=2, layers=5, output_size=IMAGE_SIZE[0]//2)(x)
+x = PatchScanner(4, x.shape, strides=1, layers=10, output_size=IMAGE_SIZE[0]//2)(x)
+x = PatchScanner(4, x.shape, strides=2, layers=10, output_size=IMAGE_SIZE[0]//4)(x)
 # x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
 # x = keras.layers.Conv2D(16, (5, 5), activation="tanh")(x)
 # x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
 x = keras.layers.Flatten()(x)
-
 x = keras.layers.BatchNormalization()(x)
+
+x = keras.layers.Dense(500, activation="relu")(x)
+x = keras.layers.Dense(100, activation="relu")(x)
 x = keras.layers.Dense(LATENT_SPACE, activation="tanh")(x)
+
 embedding_network = keras.Model(input, x)
 
 
@@ -481,43 +526,6 @@ merge_layer = keras.layers.Lambda(euclidean_distance, output_shape=(1,))(
 normal_layer = keras.layers.BatchNormalization()(merge_layer)
 output_layer = keras.layers.Dense(1, activation="sigmoid")(normal_layer)
 siamese = keras.Model(inputs=[input_1, input_2], outputs=output_layer)
-
-
-"""
-## Define the contrastive Loss
-"""
-
-
-def loss(margin=1):
-    """Provides 'contrastive_loss' an enclosing scope with variable 'margin'.
-
-    Arguments:
-        margin: Integer, defines the baseline for distance for which pairs
-                should be classified as dissimilar. - (default is 1).
-
-    Returns:
-        'contrastive_loss' function with data ('margin') attached.
-    """
-
-    # Contrastive loss = mean( (1-true_value) * square(prediction) +
-    #                         true_value * square( max(margin-prediction, 0) ))
-    def contrastive_loss(y_true, y_pred):
-        """Calculates the contrastive loss.
-
-        Arguments:
-            y_true: List of labels, each label is of type float32.
-            y_pred: List of predictions of same length as of y_true,
-                    each label is of type float32.
-
-        Returns:
-            A tensor containing contrastive loss as floating point value.
-        """
-
-        square_pred = ops.square(y_pred)
-        margin_square = ops.square(ops.maximum(margin - (y_pred), 0))
-        return ops.mean((1 - y_true) * square_pred + (y_true) * margin_square)
-
-    return contrastive_loss
 
 
 """
