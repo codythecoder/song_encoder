@@ -27,7 +27,7 @@ the class segmentation of the training inputs.
 print('importing')
 import os
 import random
-from typing import Optional
+from typing import Callable, Optional, Any
 
 import keras
 from keras import ops
@@ -37,11 +37,8 @@ import numpy as np
 from numpy import typing as npt
 
 import matplotlib.pyplot as plt
-import tensorflow as tf
-
 
 import matplotlib.pyplot as plt
-from PIL import Image
 
 from spectrogrammify import spectrogrammify
 
@@ -55,7 +52,6 @@ BATCH_SIZE = 16
 MARGIN = 1  # Margin for contrastive loss.
 LATENT_SPACE = 10
 # IMAGE_SIZE = 28, 28
-IMAGE_SIZE = 129, 413
 
 
 
@@ -63,29 +59,29 @@ class PatchScanner(layers.Layer):
     def __init__(
             self,
             patch_width: int,
-            sample_image: keras.KerasTensor,
+            image_shape: tuple[int | None, ...],
             output_size: int | None,
             strides: Optional[int | tuple[int, int]] = None,
             layers: int = 1,
-            **kwargs):
+            **kwargs: dict[Any, Any]) -> None:
         super().__init__(**kwargs)
-        sample_image_size: tuple[int, int, int] = (
-            sample_image.shape[1], # type: ignore
-            sample_image.shape[2],
-            sample_image.shape[3] if len(sample_image.shape) >= 4 else 1
-        )  # type: ignore
+        sample_image_size: tuple[int | None, int | None, int | None] = (
+            image_shape[1],
+            image_shape[2],
+            image_shape[3] if len(image_shape) >= 4 else 1
+        )
         self.patch_size = (sample_image_size[0], patch_width)
         self.strides = strides
         self.layers = layers
-        self.output_height: int = output_size or sample_image_size[0]
+        self.output_height: int | None = output_size or sample_image_size[0]
 
 
         input = keras.layers.Input((*self.patch_size, sample_image_size[2]))
         dense = keras.layers.Flatten()(input)
-        dense = keras.layers.Dense(self.output_height*self.layers)(dense)
+        dense = keras.layers.Dense(self.output_height*self.layers, activation='relu')(dense)
         self.embedding_network = keras.Model(input, dense)
 
-    def call(self, x: keras.KerasTensor):
+    def call(self, x: keras.KerasTensor) -> Any:
         # create patch virtulisation
         patches = keras.ops.image.extract_patches(x, self.patch_size, strides=self.strides)
         batch_size = keras.ops.shape(patches)[0]
@@ -95,9 +91,9 @@ class PatchScanner(layers.Layer):
         patches = keras.ops.transpose(patches, axes=(0, 2, 3, 4, 1))
 
         # fully connected layer factory
-        y: list[tf.Tensor] = keras.ops.unstack(
+        y = keras.ops.unstack(
             patches, num=None, axis=-1
-        ) # type: ignore
+        )
 
         outputs = [
             layers.Reshape((self.output_height, 1, self.layers))(self.embedding_network(layer))
@@ -125,7 +121,10 @@ class PatchScanner(layers.Layer):
 #
 
 
-def make_pairs(x, y):
+def make_pairs(
+        x: npt.NDArray[np.float32],
+        y: npt.NDArray[np.float32]
+        ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
     """Creates a tuple containing image pairs with corresponding label.
 
     Arguments:
@@ -139,9 +138,9 @@ def make_pairs(x, y):
     """
 
     num_classes = max(y) + 1
-    digit_indices = [np.where(y == i)[0] for i in range(num_classes)]
+    digit_indices = [np.where(y == i)[0].tolist() for i in range(num_classes)]
 
-    pairs = []
+    pairs: list[tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]] = []
     labels = []
 
     for idx1 in range(len(x)):
@@ -151,7 +150,7 @@ def make_pairs(x, y):
         idx2 = random.choice(digit_indices[label1])
         x2 = x[idx2]
 
-        pairs += [[x1, x2]]
+        pairs.append((x1, x2))
         labels += [0]
 
         # add a non-matching example
@@ -162,19 +161,19 @@ def make_pairs(x, y):
         idx2 = random.choice(digit_indices[label2])
         x2 = x[idx2]
 
-        pairs += [[x1, x2]]
+        pairs.append((x1, x2))
         labels += [1]
 
     return np.array(pairs), np.array(labels).astype("float32")
 
 
 def visualize(
-        pairs: npt.NDArray,
-        labels: npt.NDArray,
+        pairs: npt.NDArray[np.float32],
+        labels: npt.NDArray[np.float32],
         to_show: int = 6,
         num_col: int = 3,
-        predictions: npt.NDArray | None = None,
-        test: bool = False):
+        predictions: npt.NDArray[np.float32] | None = None,
+        test: bool = False) -> Any:
     """Creates a plot of pairs and labels, and prediction if it's test dataset.
 
     Arguments:
@@ -239,7 +238,7 @@ def visualize(
 
 # Provided two tensors t1 and t2
 # Euclidean distance = sqrt(sum(square(t1-t2)))
-def euclidean_distance(vects):
+def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> Any:
     """Find the Euclidean distance between two vectors.
 
     Arguments:
@@ -255,42 +254,55 @@ def euclidean_distance(vects):
     return ops.sqrt(ops.maximum(sum_square, keras.backend.epsilon()))
 
 
-def load_data(nperseg=256, seg_length=1500, data_length=44100*12):
-    seg_length = (seg_length // nperseg) * nperseg
-    data_length = (data_length // seg_length)
+def load_data(
+        nperseg: int = 256,
+        seg_length: int = 1500,
+        data_length: int = 12,
+        stride: int = 1,
+        ) -> tuple[
+            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]],
+            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    seg_length = (seg_length // nperseg)
 
-    folderpath = r'data'
-    filenames = [
-        '13. rain mist, snow mist, fire that follows-v04.wav',
-        'Julian Gray feat. SOFI - Revolver (Edge Split Remix) v2.wav'
-    ]
+    folderpath = r'data/audio'
+    filenames = os.listdir(folderpath)
 
-    pairs: list[tuple[npt.NDArray, int]] = []
+    train_x: list[npt.NDArray[np.float64]] = []
+    test_x: list[npt.NDArray[np.float64]] = []
+    train_y: list[int] = []
+    test_y: list[int] = []
     for i, filename in enumerate(filenames):
-        spectrogram: npt.NDArray
-        frequencies, times, spectrogram = spectrogrammify(os.path.join(folderpath, filename), nperseg=256)
+        bitrate, _, _, spectrogram = spectrogrammify(os.path.join(folderpath, filename), nperseg=nperseg)
+        data_len = ((data_length*bitrate) // (seg_length*nperseg))
         spectrogram = np.array([
-            spectrogram[:,j*5:j*5+5].mean(axis=1)
-            for j in range(len(spectrogram[0])//5)
-        ]).transpose((1, 0))
-        pairs.extend(
-            (spectrogram[:,j:j+data_length], i)
-            for j in range(spectrogram.shape[1] - data_length)
+            spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
+            for j in range(len(spectrogram[0])//seg_length)
+        ], dtype=np.float64).transpose((1, 0))
+        train_cutoff: int = int((spectrogram.shape[1] - data_len) * 0.8)
+        train_x.extend(
+            spectrogram[:,j:j+data_len]
+            for j in range(0, train_cutoff, stride)
         )
+        test_x.extend(
+            spectrogram[:,j:j+data_len]
+            for j in range(train_cutoff, spectrogram.shape[1] - data_len, stride)
+        )
+        train_y.extend([i] * len(range(0, train_cutoff, stride)))
+        test_y.extend([i] * len(range(train_cutoff, spectrogram.shape[1] - data_len, stride)))
 
     # random.shuffle(pairs)
-    split_index = int(len(pairs)*0.8)
-    train_x = np.array([pairs[i][0] for i in range(split_index)])
-    train_y = np.array([pairs[i][1] for i in range(split_index)])
-    pairs = pairs[split_index:]
+    # split_index = int(len(pairs)*0.8)
+    # train_x = np.array([pairs[i][0] for i in range(split_index)])
+    # train_y = np.array([pairs[i][1] for i in range(split_index)])
+    # pairs = pairs[split_index:]
     return (
         (
-            train_x,
-            train_y,
+            np.array(train_x),
+            np.array(train_y),
         ),
         (
-            np.array([pairs[i][0] for i in range(len(pairs))]),
-            np.array([pairs[i][1] for i in range(len(pairs))]),
+            np.array(test_x),
+            np.array(test_y),
         ),
     )
 
@@ -299,12 +311,14 @@ print('loading dataset')
 # Load the MNIST dataset
 #
 # (x_train_val, y_train_val), (x_test, y_test) = keras.datasets.mnist.load_data()
-(x_train_val, y_train_val), (x_test, y_test) = load_data()
+(_x_train, _y_train), (_x_test, _y_test) = load_data(nperseg = 128, stride=2)
 print('formatting data')
 
 # Change the data type to a floating point format
-x_train_val = x_train_val.astype("float32")
-x_test = x_test.astype("float32")
+x_train: npt.NDArray[np.float32] = _x_train.astype("float32")
+x_test: npt.NDArray[np.float32] = _x_test.astype("float32")
+y_train: npt.NDArray[np.int8] = _y_train.astype("int8")
+y_test: npt.NDArray[np.int8] = _y_test.astype("int8")
 
 
 #
@@ -312,9 +326,9 @@ x_test = x_test.astype("float32")
 #
 
 # Keep 50% of train_val  in validation set
-x_train, x_val = x_train_val[:30000], x_train_val[30000:]
-y_train, y_val = y_train_val[:30000], y_train_val[30000:]
-del x_train_val, y_train_val
+# x_train, x_val = x_train_val[:30000], x_train_val[30000:]
+# y_train, y_val = y_train_val[:30000], y_train_val[30000:]
+# del x_train_val, y_train_val
 
 
 
@@ -436,6 +450,7 @@ merged output is fed to the final network.
 """
 
 
+IMAGE_SIZE = x_test_1.shape[1:]
 input = keras.layers.Input((*IMAGE_SIZE, 1))
 x = keras.layers.BatchNormalization()(input)
 x = PatchScanner(4, x, strides=1, layers=3, output_size=IMAGE_SIZE[0]//2)(x)
@@ -510,6 +525,7 @@ def loss(margin=1):
 """
 
 siamese.compile(loss=loss(margin=MARGIN), optimizer="RMSprop", metrics=["accuracy"])
+embedding_network.summary()
 siamese.summary()
 
 
@@ -525,7 +541,7 @@ history = siamese.fit(
     epochs=EPOCHS,
 )
 
-history.save('out.keras')
+siamese.save('out.keras')
 
 """
 ## Visualize results

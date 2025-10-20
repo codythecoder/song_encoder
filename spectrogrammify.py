@@ -1,15 +1,21 @@
 from typing import Optional
 from scipy import signal
 import numpy as np
+import numpy.typing as npt
 from scipy.io import wavfile
 
 
 def spectrogrammify(
         filepath: str,
         audio_channel: int = 0,
-        nperseg=256,
+        nperseg: int = 256,
         nfft: Optional[int] = None,
-        noverlap=0):
+        noverlap: int = 0,
+        ) -> tuple[
+            int,
+            npt.NDArray[np.float64],
+            npt.NDArray[np.float64],
+            npt.NDArray[np.float64]]:
 
     beginning_silence = nperseg - noverlap
 
@@ -35,7 +41,7 @@ def spectrogrammify(
     print(f'{sample_rate=}')
     print(f'samples_per_second={len(times)/(len(samples)/sample_rate):.2f}')
 
-    return frequencies, times[1:], spectrogram[:,1:]
+    return sample_rate, frequencies, times[1:], spectrogram[:,1:]
 
 
 
