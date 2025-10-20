@@ -105,6 +105,59 @@ class PatchScanner(layers.Layer):
         return output
 
 
+def load_data(
+        nperseg: int = 256,
+        seg_length: int = 1500,
+        data_length: int = 12,
+        stride: int = 1,
+        ) -> tuple[
+            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]],
+            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
+    seg_length = (seg_length // nperseg)
+
+    folderpath = r'data/audio'
+    filenames = os.listdir(folderpath)
+
+    train_x: list[npt.NDArray[np.float64]] = []
+    test_x: list[npt.NDArray[np.float64]] = []
+    train_y: list[int] = []
+    test_y: list[int] = []
+    for i, filename in enumerate(filenames):
+        bitrate, _, _, spectrogram = spectrogrammify(os.path.join(folderpath, filename), nperseg=nperseg)
+        data_len = ((data_length*bitrate) // (seg_length*nperseg))
+        spectrogram = np.array([
+            spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
+            for j in range(len(spectrogram[0])//seg_length)
+        ], dtype=np.float64).transpose((1, 0))
+        train_cutoff: int = int((spectrogram.shape[1] - data_len) * 0.8)
+        train_x.extend(
+            spectrogram[:,j:j+data_len]
+            for j in range(0, train_cutoff, stride)
+        )
+        test_x.extend(
+            spectrogram[:,j:j+data_len]
+            for j in range(train_cutoff, spectrogram.shape[1] - data_len, stride)
+        )
+        train_y.extend([i] * len(range(0, train_cutoff, stride)))
+        test_y.extend([i] * len(range(train_cutoff, spectrogram.shape[1] - data_len, stride)))
+
+    # random.shuffle(pairs)
+    # split_index = int(len(pairs)*0.8)
+    # train_x = np.array([pairs[i][0] for i in range(split_index)])
+    # train_y = np.array([pairs[i][1] for i in range(split_index)])
+    # pairs = pairs[split_index:]
+    return (
+        (
+            np.array(train_x),
+            np.array(train_y),
+        ),
+        (
+            np.array(test_x),
+            np.array(test_y),
+        ),
+    )
+
+
 
 #
 # Create pairs of images
@@ -254,59 +307,6 @@ def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> An
     return ops.sqrt(ops.maximum(sum_square, keras.backend.epsilon()))
 
 
-def load_data(
-        nperseg: int = 256,
-        seg_length: int = 1500,
-        data_length: int = 12,
-        stride: int = 1,
-        ) -> tuple[
-            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]],
-            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
-    seg_length = (seg_length // nperseg)
-
-    folderpath = r'data/audio'
-    filenames = os.listdir(folderpath)
-
-    train_x: list[npt.NDArray[np.float64]] = []
-    test_x: list[npt.NDArray[np.float64]] = []
-    train_y: list[int] = []
-    test_y: list[int] = []
-    for i, filename in enumerate(filenames):
-        bitrate, _, _, spectrogram = spectrogrammify(os.path.join(folderpath, filename), nperseg=nperseg)
-        data_len = ((data_length*bitrate) // (seg_length*nperseg))
-        spectrogram = np.array([
-            spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
-            for j in range(len(spectrogram[0])//seg_length)
-        ], dtype=np.float64).transpose((1, 0))
-        train_cutoff: int = int((spectrogram.shape[1] - data_len) * 0.8)
-        train_x.extend(
-            spectrogram[:,j:j+data_len]
-            for j in range(0, train_cutoff, stride)
-        )
-        test_x.extend(
-            spectrogram[:,j:j+data_len]
-            for j in range(train_cutoff, spectrogram.shape[1] - data_len, stride)
-        )
-        train_y.extend([i] * len(range(0, train_cutoff, stride)))
-        test_y.extend([i] * len(range(train_cutoff, spectrogram.shape[1] - data_len, stride)))
-
-    # random.shuffle(pairs)
-    # split_index = int(len(pairs)*0.8)
-    # train_x = np.array([pairs[i][0] for i in range(split_index)])
-    # train_y = np.array([pairs[i][1] for i in range(split_index)])
-    # pairs = pairs[split_index:]
-    return (
-        (
-            np.array(train_x),
-            np.array(train_y),
-        ),
-        (
-            np.array(test_x),
-            np.array(test_y),
-        ),
-    )
-
-
 """
 ## Define the contrastive Loss
 """
@@ -345,6 +345,30 @@ def loss(margin: float = 1) -> Callable:
         return ops.mean((1 - y_true) * square_pred + (y_true) * margin_square)
 
     return contrastive_loss
+
+
+def plt_metric(history, metric, title, has_valid=True):
+    """Plots the given 'metric' from 'history'.
+
+    Arguments:
+        history: history attribute of History object returned from Model.fit.
+        metric: Metric to plot, a string value present as key in 'history'.
+        title: A string to be used as title of plot.
+        has_valid: Boolean, true if valid data was passed to Model.fit else false.
+
+    Returns:
+        None.
+    """
+    plt.plot(history[metric])
+    if has_valid:
+        plt.plot(history["val_" + metric])
+        plt.legend(["train", "validation"], loc="upper left")
+    plt.title(title)
+    plt.ylabel(metric)
+    plt.xlabel("epoch")
+    plt.show()
+
+
 
 print('loading dataset')
 #
@@ -554,28 +578,6 @@ siamese.save('out.keras')
 """
 ## Visualize results
 """
-
-
-def plt_metric(history, metric, title, has_valid=True):
-    """Plots the given 'metric' from 'history'.
-
-    Arguments:
-        history: history attribute of History object returned from Model.fit.
-        metric: Metric to plot, a string value present as key in 'history'.
-        title: A string to be used as title of plot.
-        has_valid: Boolean, true if valid data was passed to Model.fit else false.
-
-    Returns:
-        None.
-    """
-    plt.plot(history[metric])
-    if has_valid:
-        plt.plot(history["val_" + metric])
-        plt.legend(["train", "validation"], loc="upper left")
-    plt.title(title)
-    plt.ylabel(metric)
-    plt.xlabel("epoch")
-    plt.show()
 
 
 # Plot the accuracy
