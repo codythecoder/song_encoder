@@ -51,7 +51,7 @@ Raw_Data_Point_Type: TypeAlias = tuple[tuple[Image_Type, Image_Type], int]
 EPOCHS = 10
 BATCH_SIZE = 16
 MARGIN = 1  # Margin for contrastive loss.
-LATENT_SPACE = 10
+LATENT_SPACE = 20
 TRAIN_TEST_SPLIT = 0.8
 MAX_BATCHES_PER_EPOCH = 5000
 
@@ -136,6 +136,15 @@ class PatchScanner(layers.Layer):
         return output
 
 
+def get_audio_files(audio_folder: str = AUDIO_FOLDER) -> list[str]:
+    return [
+        os.path.join(p, fname)
+        for p, d, f in os.walk(AUDIO_FOLDER)
+        for fname in f
+        if fname.endswith('.wav')
+    ]
+
+
 def load_data(
         filepath: str,
         nperseg: int = 256,
@@ -143,7 +152,10 @@ def load_data(
         ) -> npt.NDArray[np.float64]:
 
     bitrate, _, _, spectrogram = spectrogrammify(filepath, nperseg=nperseg)
-    assert bitrate == EXPECTED_BITRATE
+    if bitrate != EXPECTED_BITRATE:
+        print(bitrate)
+        print(filepath)
+        assert bitrate == EXPECTED_BITRATE
 
     spectrogram = np.array([
         spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
@@ -152,84 +164,52 @@ def load_data(
 
     return spectrogram
 
-# a = load_data('data/audio/hsp2-v5.wav', SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING)
-
-def stream_pairs(
-        filenames: list[str],
-        data_width: int,
-        num_active_files: int = 2,
-        difference_value: int = 1,
-        spectrogram_nperseg: int = SPECTROGRAM_NPERSEG,
-        spectrogram_frame_grouping: int = SPECTROGRAM_FRAME_GROUPING,
-        ) -> Callable[..., Generator[Raw_Data_Point_Type, None, None]]:
-    if num_active_files < 2:
-        raise ValueError('`num_active_files` must be 2 or greater')
-    if num_active_files >= len(filenames):
-        raise ValueError('`num_active_files` must be less than the number of filenames')
-
-    active_spectrograms: dict[str, npt.NDArray[np.float32]] = {}
-    active_spectrogram_queues: dict[str, list[int]] = {}
-    active_filenames: list[str] = []
-
-    def pairs() -> Generator[Raw_Data_Point_Type, None, None]:
-        def delete_if_empty(filename: str) -> None:
-            if len(active_spectrogram_queues[filename]) < 2:
-                # print('deleting', filename)
-                active_filenames.remove(filename)
-                del active_spectrograms[filename]
-                del active_spectrogram_queues[filename]
-
-        while True:
-            while len(active_filenames) < num_active_files:
-                filename_to_get = random.choice([f for f in filenames if f not in active_spectrograms])
-                # print('loading', filename_to_get)
-                active_filenames.append(filename_to_get)
-                spectrogram: npt.NDArray[np.float32]
-                spectrogram = load_data(
-                    filename_to_get, spectrogram_nperseg, spectrogram_frame_grouping
-                    ).astype(np.float32)
-                active_spectrograms[filename_to_get] = spectrogram
-                active_spectrogram_queues[filename_to_get] = list(range(spectrogram.shape[1]-data_width))
-                random.shuffle(active_spectrogram_queues[filename_to_get])
-
-            if random.randrange(2):
-                # same
-                filename = random.choice(active_filenames)
-                idx1 = active_spectrogram_queues[filename].pop(0)
-                idx2 = active_spectrogram_queues[filename].pop(0)
-                sample1 = active_spectrograms[filename][:,idx1:idx1+data_width]
-                sample2 = active_spectrograms[filename][:,idx2:idx2+data_width]
-                result = 0
-                delete_if_empty(filename)
-            else:
-                # different
-                filename1, filename2 = random.sample(active_filenames, 2)
-                idx1 = active_spectrogram_queues[filename1].pop(0)
-                idx2 = active_spectrogram_queues[filename2].pop(0)
-                sample1 = active_spectrograms[filename1][:,idx1:idx1+data_width]
-                sample2 = active_spectrograms[filename2][:,idx2:idx2+data_width]
-                result = difference_value
-                delete_if_empty(filename1)
-                delete_if_empty(filename2)
-
-            yield (sample1, sample2), result
-
-    return pairs
-
 
 class DataGenerator(keras.utils.PyDataset):
     def __init__(
             self,
-            streamer: Callable[..., Iterable[Raw_Data_Point_Type]],
+            filenames: list[str],
+            data_width: int,
+            batch_size: int = BATCH_SIZE,
             dim: tuple[int, ...] = IMAGE_SIZE,
+            num_active_files: int = 2,
+            difference_value: int = MARGIN,
+            spectrogram_nperseg: int = SPECTROGRAM_NPERSEG,
+            spectrogram_frame_grouping: int = SPECTROGRAM_FRAME_GROUPING,
             ) -> None:
         super().__init__()
-        self.streamer = streamer
+
+        self.all_filenames = filenames
+        self.batch_size = batch_size
         self.dim = dim
+        self.data_width = data_width
+        self.num_active_files = num_active_files
+        self.difference_value = difference_value
+        self.spectrogram_nperseg = spectrogram_nperseg
+        self.spectrogram_frame_grouping = spectrogram_frame_grouping
+
+        self.active_spectrograms: dict[str, npt.NDArray[np.float32]] = {}
+        self.active_spectrogram_queues: dict[str, list[int]] = {}
+        self.active_filenames: list[str] = []
+
+        self.curr_filename_index = 0
+
+        self.spectrogram_lengths = {
+            fname: MAX_BATCHES_PER_EPOCH
+            for fname in self.all_filenames
+        }
+
+        self.on_epoch_end()
+
+        while len(self.active_filenames) < self.num_active_files:
+            self._load_one_spectrogram()
 
     def __len__(self) -> int:
         'Denotes the number of batches per epoch'
-        return MAX_BATCHES_PER_EPOCH
+        return min(
+            MAX_BATCHES_PER_EPOCH,
+            sum(self.spectrogram_lengths.values()) // self.batch_size
+        )
 
     def __getitem__(
             self,
@@ -243,12 +223,14 @@ class DataGenerator(keras.utils.PyDataset):
             ]:
         'Generates data containing batch_size samples' # X : (n_samples, *dim, n_channels)
         # Initialization
-        x1 = np.empty((BATCH_SIZE, *self.dim), dtype=np.float32)
-        x2 = np.empty((BATCH_SIZE, *self.dim), dtype=np.float32)
-        y = np.empty((BATCH_SIZE,), dtype=np.float32)
+        x1 = np.empty((self.batch_size, *self.dim), dtype=np.float32)
+        x2 = np.empty((self.batch_size, *self.dim), dtype=np.float32)
+        y = np.empty((self.batch_size,), dtype=np.float32)
 
         # Generate data
-        for i, ((in1, in2), out) in zip(range(BATCH_SIZE), self.streamer()):
+        for i in range(self.batch_size):
+            (in1, in2), out = self._get_one()
+
             # Store sample
             x1[i] = in1
             x2[i] = in2
@@ -257,6 +239,65 @@ class DataGenerator(keras.utils.PyDataset):
             y[i] = out
 
         return (x1, x2), y
+
+    def _get_one(self) -> Raw_Data_Point_Type:
+        if random.randrange(2):
+            # same
+            filename = random.choice(self.active_filenames)
+            idx1 = self.active_spectrogram_queues[filename].pop(0)
+            idx2 = self.active_spectrogram_queues[filename].pop(0)
+            sample1 = self.active_spectrograms[filename][:,idx1:idx1+self.data_width]
+            sample2 = self.active_spectrograms[filename][:,idx2:idx2+self.data_width]
+            result = 0
+            self._delete_if_empty(filename)
+        else:
+            # different
+            filename1, filename2 = random.sample(self.active_filenames, 2)
+            idx1 = self.active_spectrogram_queues[filename1].pop(0)
+            idx2 = self.active_spectrogram_queues[filename2].pop(0)
+            sample1 = self.active_spectrograms[filename1][:,idx1:idx1+self.data_width]
+            sample2 = self.active_spectrograms[filename2][:,idx2:idx2+self.data_width]
+            result = self.difference_value
+            self._delete_if_empty(filename1)
+            self._delete_if_empty(filename2)
+
+        return (sample1, sample2), result
+
+    def _load_one_spectrogram(self) -> None:
+        while filename_to_get := self.all_filenames[self.curr_filename_index]:
+            if filename_to_get not in self.active_spectrograms:
+                break
+            self.curr_filename_index += 1
+            self.curr_filename_index %= len(self.all_filenames)
+
+        filename_to_get = self.all_filenames[self.curr_filename_index]
+        # print('loading', filename_to_get)
+        self.active_filenames.append(filename_to_get)
+        spectrogram: npt.NDArray[np.float32]
+        spectrogram = load_data(
+            filename_to_get, self.spectrogram_nperseg, self.spectrogram_frame_grouping
+            ).astype(np.float32)
+        self.active_spectrograms[filename_to_get] = spectrogram
+        self.active_spectrogram_queues[filename_to_get] = list(range(spectrogram.shape[1]-self.data_width))
+        random.shuffle(self.active_spectrogram_queues[filename_to_get])
+
+        self.spectrogram_lengths[filename_to_get] = len(self.active_spectrogram_queues[filename_to_get])
+        self.curr_filename_index += 1
+        self.curr_filename_index %= len(self.all_filenames)
+
+    def _delete_if_empty(self, filename: str) -> None:
+        if len(self.active_spectrogram_queues[filename]) < 2:
+            # print('deleting', filename)
+            self.active_filenames.remove(filename)
+            del self.active_spectrograms[filename]
+            del self.active_spectrogram_queues[filename]
+
+            self._load_one_spectrogram()
+
+    def on_epoch_end(self) -> None:
+        random.shuffle(self.all_filenames)
+        self.curr_filename_index = 0
+        return None
 
 
 
@@ -352,7 +393,7 @@ def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> An
 """
 
 
-def loss(margin: float = 1) -> Callable:
+def loss(margin: float = MARGIN) -> Callable:
     """Provides 'contrastive_loss' an enclosing scope with variable 'margin'.
 
     Arguments:
@@ -411,15 +452,21 @@ def plt_metric(history, metric, title, has_valid=True):
 
 
 
-input_filepaths = [os.path.join(AUDIO_FOLDER, fname) for fname in os.listdir(AUDIO_FOLDER)]
+input_filepaths = get_audio_files(AUDIO_FOLDER)
+random.shuffle(input_filepaths)
 train_filepaths = input_filepaths[:int(len(input_filepaths)*TRAIN_TEST_SPLIT)]
 test_filepaths = [fpath for fpath in input_filepaths if fpath not in train_filepaths]
 
-train_streamer = stream_pairs(train_filepaths, IMAGE_WIDTH, num_active_files=5)
-test_streamer = stream_pairs(test_filepaths, IMAGE_WIDTH, num_active_files=2)
-
-train_data = DataGenerator(train_streamer)
-test_data = DataGenerator(test_streamer)
+train_data = DataGenerator(
+    train_filepaths,
+    IMAGE_WIDTH,
+    num_active_files=5,
+)
+test_data = DataGenerator(
+    test_filepaths,
+    IMAGE_WIDTH,
+    num_active_files=2,
+)
 
 
 """
@@ -481,6 +528,11 @@ siamese.summary()
 """
 ## Train the model
 """
+
+print()
+print('training on', len(train_filepaths), 'songs')
+print('testing on', len(test_filepaths), 'songs')
+print()
 
 history = siamese.fit(
     x=train_data,
