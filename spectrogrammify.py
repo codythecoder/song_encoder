@@ -32,14 +32,14 @@ def spectrogrammify(
 
     frequencies, times, spectrogram = signal.spectrogram(samples, sample_rate, nperseg=nperseg, nfft=nfft, noverlap=noverlap, scaling='spectrum')
 
-    print(f'{nperseg=}')
-    print(f'{nfft=}')
-    print(f'{noverlap=}')
-    print(f'{len(frequencies)=}')
-    print(f'{len(samples)=}')
-    print(f'{len(times)=}')
-    print(f'{sample_rate=}')
-    print(f'samples_per_second={len(times)/(len(samples)/sample_rate):.2f}')
+    # print(f'{nperseg=}')
+    # print(f'{nfft=}')
+    # print(f'{noverlap=}')
+    # print(f'{len(frequencies)=}')
+    # print(f'{len(samples)=}')
+    # print(f'{len(times)=}')
+    # print(f'{sample_rate=}')
+    # print(f'samples_per_second={len(times)/(len(samples)/sample_rate):.2f}')
 
     return sample_rate, frequencies, times[1:], spectrogram[:,1:]
 

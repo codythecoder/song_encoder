@@ -27,7 +27,7 @@ the class segmentation of the training inputs.
 print('importing')
 import os
 import random
-from typing import Callable, Optional, Any
+from typing import Callable, Generator, Iterable, Optional, Any, TypeAlias
 
 import keras
 from keras import ops
@@ -38,9 +38,10 @@ from numpy import typing as npt
 
 import matplotlib.pyplot as plt
 
-import matplotlib.pyplot as plt
-
 from spectrogrammify import spectrogrammify
+
+Image_Type: TypeAlias = npt.NDArray[np.float32]
+Raw_Data_Point_Type: TypeAlias = tuple[tuple[Image_Type, Image_Type], int]
 
 
 #
@@ -51,7 +52,37 @@ EPOCHS = 10
 BATCH_SIZE = 16
 MARGIN = 1  # Margin for contrastive loss.
 LATENT_SPACE = 10
-# IMAGE_SIZE = 28, 28
+TRAIN_TEST_SPLIT = 0.8
+MAX_BATCHES_PER_EPOCH = 5000
+
+AUDIO_FOLDER = 'data/audio'
+
+# don't process any file that uses a different bitrate
+EXPECTED_BITRATE = 44100
+# the raw window to calculate the spectrogram over (as a section of the bitrate)
+#   changing this will also change the number of frequency buckets returned from scipy
+SPECTROGRAM_NPERSEG = 128
+# number of raw spectrogram frames to average over
+#   nperseg will change the
+SPECTROGRAM_FRAME_GROUPING = 12  # ~1500 from bitrate
+# how many frames to input to the learning model
+IMAGE_WIDTH = 360  # ~13 seconds
+
+# i'm so sorry
+#   you gotta find this by trial and error
+# IMAGE_HEIGHT = load_data('file.wav', SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING).shape[0]
+IMAGE_HEIGHT = 65
+
+IMAGE_SIZE = IMAGE_HEIGHT, IMAGE_WIDTH
+
+##### HERE'S THE OUTPUTS THAT MATTER TO YOU #####
+# data input rate = (EXPECTED_BITRATE / SPECTROGRAM_FRAME_GROUPING) frames per second
+#   i've tried to go for ~30 because it "feels right"
+# print(EXPECTED_BITRATE / SPECTROGRAM_FRAME_GROUPING)
+
+# image width in seconds = IMAGE_WIDTH * SPECTROGRAM_FRAME_GROUPING * SPECTROGRAM_NPERSEG / EXPECTED_BITRATE
+#   this is ~12 seconds for no real reason
+# print(IMAGE_WIDTH * SPECTROGRAM_FRAME_GROUPING * SPECTROGRAM_NPERSEG / EXPECTED_BITRATE)
 
 
 
@@ -106,118 +137,127 @@ class PatchScanner(layers.Layer):
 
 
 def load_data(
+        filepath: str,
         nperseg: int = 256,
-        seg_length: int = 1500,
-        data_length: int = 12,
-        stride: int = 1,
-        ) -> tuple[
-            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]],
-            tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]:
-    seg_length = (seg_length // nperseg)
+        seg_length: int = 1,
+        ) -> npt.NDArray[np.float64]:
 
-    folderpath = r'data/audio'
-    filenames = os.listdir(folderpath)
+    bitrate, _, _, spectrogram = spectrogrammify(filepath, nperseg=nperseg)
+    assert bitrate == EXPECTED_BITRATE
 
-    train_x: list[npt.NDArray[np.float64]] = []
-    test_x: list[npt.NDArray[np.float64]] = []
-    train_y: list[int] = []
-    test_y: list[int] = []
-    for i, filename in enumerate(filenames):
-        bitrate, _, _, spectrogram = spectrogrammify(os.path.join(folderpath, filename), nperseg=nperseg)
-        data_len = ((data_length*bitrate) // (seg_length*nperseg))
-        spectrogram = np.array([
-            spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
-            for j in range(len(spectrogram[0])//seg_length)
-        ], dtype=np.float64).transpose((1, 0))
-        train_cutoff: int = int((spectrogram.shape[1] - data_len) * 0.8)
-        train_x.extend(
-            spectrogram[:,j:j+data_len]
-            for j in range(0, train_cutoff, stride)
-        )
-        test_x.extend(
-            spectrogram[:,j:j+data_len]
-            for j in range(train_cutoff, spectrogram.shape[1] - data_len, stride)
-        )
-        train_y.extend([i] * len(range(0, train_cutoff, stride)))
-        test_y.extend([i] * len(range(train_cutoff, spectrogram.shape[1] - data_len, stride)))
+    spectrogram = np.array([
+        spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
+        for j in range(len(spectrogram[0])//seg_length)
+    ], dtype=np.float64).transpose((1, 0))
 
-    # random.shuffle(pairs)
-    # split_index = int(len(pairs)*0.8)
-    # train_x = np.array([pairs[i][0] for i in range(split_index)])
-    # train_y = np.array([pairs[i][1] for i in range(split_index)])
-    # pairs = pairs[split_index:]
-    return (
-        (
-            np.array(train_x),
-            np.array(train_y),
-        ),
-        (
-            np.array(test_x),
-            np.array(test_y),
-        ),
-    )
+    return spectrogram
+
+# a = load_data('data/audio/hsp2-v5.wav', SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING)
+
+def stream_pairs(
+        filenames: list[str],
+        data_width: int,
+        num_active_files: int = 2,
+        difference_value: int = 1,
+        spectrogram_nperseg: int = SPECTROGRAM_NPERSEG,
+        spectrogram_frame_grouping: int = SPECTROGRAM_FRAME_GROUPING,
+        ) -> Callable[..., Generator[Raw_Data_Point_Type, None, None]]:
+    if num_active_files < 2:
+        raise ValueError('`num_active_files` must be 2 or greater')
+    if num_active_files >= len(filenames):
+        raise ValueError('`num_active_files` must be less than the number of filenames')
+
+    active_spectrograms: dict[str, npt.NDArray[np.float32]] = {}
+    active_spectrogram_queues: dict[str, list[int]] = {}
+    active_filenames: list[str] = []
+
+    def pairs() -> Generator[Raw_Data_Point_Type, None, None]:
+        def delete_if_empty(filename: str) -> None:
+            if len(active_spectrogram_queues[filename]) < 2:
+                # print('deleting', filename)
+                active_filenames.remove(filename)
+                del active_spectrograms[filename]
+                del active_spectrogram_queues[filename]
+
+        while True:
+            while len(active_filenames) < num_active_files:
+                filename_to_get = random.choice([f for f in filenames if f not in active_spectrograms])
+                # print('loading', filename_to_get)
+                active_filenames.append(filename_to_get)
+                spectrogram: npt.NDArray[np.float32]
+                spectrogram = load_data(
+                    filename_to_get, spectrogram_nperseg, spectrogram_frame_grouping
+                    ).astype(np.float32)
+                active_spectrograms[filename_to_get] = spectrogram
+                active_spectrogram_queues[filename_to_get] = list(range(spectrogram.shape[1]-data_width))
+                random.shuffle(active_spectrogram_queues[filename_to_get])
+
+            if random.randrange(2):
+                # same
+                filename = random.choice(active_filenames)
+                idx1 = active_spectrogram_queues[filename].pop(0)
+                idx2 = active_spectrogram_queues[filename].pop(0)
+                sample1 = active_spectrograms[filename][:,idx1:idx1+data_width]
+                sample2 = active_spectrograms[filename][:,idx2:idx2+data_width]
+                result = 0
+                delete_if_empty(filename)
+            else:
+                # different
+                filename1, filename2 = random.sample(active_filenames, 2)
+                idx1 = active_spectrogram_queues[filename1].pop(0)
+                idx2 = active_spectrogram_queues[filename2].pop(0)
+                sample1 = active_spectrograms[filename1][:,idx1:idx1+data_width]
+                sample2 = active_spectrograms[filename2][:,idx2:idx2+data_width]
+                result = difference_value
+                delete_if_empty(filename1)
+                delete_if_empty(filename2)
+
+            yield (sample1, sample2), result
+
+    return pairs
 
 
+class DataGenerator(keras.utils.PyDataset):
+    def __init__(
+            self,
+            streamer: Callable[..., Iterable[Raw_Data_Point_Type]],
+            dim: tuple[int, ...] = IMAGE_SIZE,
+            ) -> None:
+        super().__init__()
+        self.streamer = streamer
+        self.dim = dim
 
-#
-# Create pairs of images
-#
-# We will train the model to differentiate between digits of different classes. For
-# example, digit `0` needs to be differentiated from the rest of the
-# digits (`1` through `9`), digit `1` - from `0` and `2` through `9`, and so on.
-# To carry this out, we will select N random images from class A (for example,
-# for digit `0`) and pair them with N random images from another class B
-# (for example, for digit `1`). Then, we can repeat this process for all classes
-# of digits (until digit `9`). Once we have paired digit `0` with other digits,
-# we can repeat this process for the remaining classes for the rest of the digits
-# (from `1` until `9`).
-#
+    def __len__(self) -> int:
+        'Denotes the number of batches per epoch'
+        return MAX_BATCHES_PER_EPOCH
 
+    def __getitem__(
+            self,
+            index: int = 0,
+            ) -> tuple[
+                tuple[
+                    npt.NDArray[np.float32],
+                    npt.NDArray[np.float32],
+                ],
+                npt.NDArray[np.float32],
+            ]:
+        'Generates data containing batch_size samples' # X : (n_samples, *dim, n_channels)
+        # Initialization
+        x1 = np.empty((BATCH_SIZE, *self.dim), dtype=np.float32)
+        x2 = np.empty((BATCH_SIZE, *self.dim), dtype=np.float32)
+        y = np.empty((BATCH_SIZE,), dtype=np.float32)
 
-def make_pairs(
-        x: npt.NDArray[np.float32],
-        y: npt.NDArray[np.float32]
-        ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """Creates a tuple containing image pairs with corresponding label.
+        # Generate data
+        for i, ((in1, in2), out) in zip(range(BATCH_SIZE), self.streamer()):
+            # Store sample
+            x1[i] = in1
+            x2[i] = in2
 
-    Arguments:
-        x: List containing images, each index in this list corresponds to one image.
-        y: List containing labels, each label with datatype of `int`.
+            # Store class
+            y[i] = out
 
-    Returns:
-        Tuple containing two numpy arrays as (pairs_of_samples, labels),
-        where pairs_of_samples' shape is (2len(x), 2,n_features_dims) and
-        labels are a binary array of shape (2len(x)).
-    """
+        return (x1, x2), y
 
-    num_classes = max(y) + 1
-    digit_indices = [np.where(y == i)[0].tolist() for i in range(num_classes)]
-
-    pairs: list[tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]] = []
-    labels = []
-
-    for idx1 in range(len(x)):
-        # add a matching example
-        x1 = x[idx1]
-        label1 = y[idx1]
-        idx2 = random.choice(digit_indices[label1])
-        x2 = x[idx2]
-
-        pairs.append((x1, x2))
-        labels += [0]
-
-        # add a non-matching example
-        label2 = random.randint(0, num_classes - 1)
-        while label2 == label1:
-            label2 = random.randint(0, num_classes - 1)
-
-        idx2 = random.choice(digit_indices[label2])
-        x2 = x[idx2]
-
-        pairs.append((x1, x2))
-        labels += [1]
-
-    return np.array(pairs), np.array(labels).astype("float32")
 
 
 def visualize(
@@ -370,139 +410,17 @@ def plt_metric(history, metric, title, has_valid=True):
 
 
 
-print('loading dataset')
-#
-# Load the MNIST dataset
-#
-# (x_train_val, y_train_val), (x_test, y_test) = keras.datasets.mnist.load_data()
-(_x_train, _y_train), (_x_test, _y_test) = load_data(nperseg = 128, stride=2)
-print('formatting data')
 
-# Change the data type to a floating point format
-x_train: npt.NDArray[np.float32] = _x_train.astype("float32")
-x_test: npt.NDArray[np.float32] = _x_test.astype("float32")
-y_train: npt.NDArray[np.int8] = _y_train.astype("int8")
-y_test: npt.NDArray[np.int8] = _y_test.astype("int8")
+input_filepaths = [os.path.join(AUDIO_FOLDER, fname) for fname in os.listdir(AUDIO_FOLDER)]
+train_filepaths = input_filepaths[:int(len(input_filepaths)*TRAIN_TEST_SPLIT)]
+test_filepaths = [fpath for fpath in input_filepaths if fpath not in train_filepaths]
 
+train_streamer = stream_pairs(train_filepaths, IMAGE_WIDTH, num_active_files=5)
+test_streamer = stream_pairs(test_filepaths, IMAGE_WIDTH, num_active_files=2)
 
-#
-# Define training and validation sets
-#
+train_data = DataGenerator(train_streamer)
+test_data = DataGenerator(test_streamer)
 
-# Keep 50% of train_val  in validation set
-# x_train, x_val = x_train_val[:30000], x_train_val[30000:]
-# y_train, y_val = y_train_val[:30000], y_train_val[30000:]
-# del x_train_val, y_train_val
-
-
-
-
-# print('testing patches')
-
-# PATCH_SHAPE = 36, 9
-# IMAGE_SIZE = 36, 36
-# BATCH_SIZE = 2
-# COLOR_CHANNELS = 3
-
-# images = [
-#     Image.open(r'temp1.png'),
-#     Image.open(r'temp2.png'),
-# ]
-
-# first_array=np.reshape(images[:BATCH_SIZE], (BATCH_SIZE, *IMAGE_SIZE, 3))
-# first_array = first_array.astype("float32")/255
-
-# patches = keras.ops.image.extract_patches(first_array, PATCH_SHAPE, padding='valid')
-
-# num_patches = keras.ops.shape(patches)[1] * keras.ops.shape(patches)[2]
-# patch_dim = keras.ops.shape(patches)[3]
-
-# out = keras.ops.reshape(patches, (BATCH_SIZE, num_patches, *PATCH_SHAPE, COLOR_CHANNELS))
-# # out = keras.ops.transpose(out, axes=(0, 2, 3, 4, 1))
-
-# f, axarr = plt.subplots(1,4)
-
-# # axarr[0].imshow(out[0,:,:,:,0])
-# # axarr[1].imshow(out[0,:,:,:,1])
-# # axarr[2].imshow(out[0,:,:,:,2])
-# # axarr[3].imshow(out[0,:,:,:,3])
-# axarr[0].imshow(out[0,0])
-# axarr[1].imshow(out[0,1])
-# axarr[2].imshow(out[0,2])
-# axarr[3].imshow(out[0,3])
-
-# #Actually displaying the plot if you are not in interactive mode
-# plt.show()
-# # input()
-
-
-
-
-
-
-# make train pairs
-pairs_train, labels_train = make_pairs(x_train, y_train)
-
-# make validation pairs
-# pairs_val, labels_val = make_pairs(x_val, y_val)
-
-# make test pairs
-pairs_test, labels_test = make_pairs(x_test, y_test)
-
-"""
-We get:
-
-**pairs_train.shape = (60000, 2, *IMAGE_SIZE)**
-
-- We have 60,000 pairs
-- Each pair contains 2 images
-- Each image has shape `(*IMAGE_SIZE)`
-"""
-
-"""
-Split the training pairs
-"""
-
-x_train_1 = pairs_train[:, 0]  # x_train_1.shape is (60000, *IMAGE_SIZE)
-x_train_2 = pairs_train[:, 1]
-
-"""
-Split the validation pairs
-"""
-
-# x_val_1 = pairs_val[:, 0]  # x_val_1.shape = (60000, *IMAGE_SIZE)
-# x_val_2 = pairs_val[:, 1]
-
-"""
-Split the test pairs
-"""
-
-x_test_1 = pairs_test[:, 0]  # x_test_1.shape = (20000, *IMAGE_SIZE)
-x_test_2 = pairs_test[:, 1]
-
-
-"""
-## Visualize pairs and their labels
-"""
-
-
-"""
-Inspect training pairs
-"""
-
-# visualize(pairs_train[:-1], labels_train[:-1], to_show=4, num_col=4)
-
-"""
-Inspect validation pairs
-"""
-
-# visualize(pairs_val[:-1], labels_val[:-1], to_show=4, num_col=4)
-
-"""
-Inspect test pairs
-"""
-
-# visualize(pairs_test[:-1], labels_test[:-1], to_show=4, num_col=4)
 
 """
 ## Define the model
@@ -514,7 +432,6 @@ merged output is fed to the final network.
 """
 
 
-IMAGE_SIZE = x_test_1.shape[1:]
 input = keras.layers.Input((*IMAGE_SIZE, 1))
 x = keras.layers.BatchNormalization()(input)
 x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
@@ -566,9 +483,8 @@ siamese.summary()
 """
 
 history = siamese.fit(
-    [x_train_1, x_train_2],
-    labels_train,
-    validation_data=([x_test_1, x_test_2], labels_test),
+    x=train_data,
+    validation_data=test_data,
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
 )
