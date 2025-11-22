@@ -1,4 +1,5 @@
 from typing import Optional
+import warnings
 from scipy import signal
 import numpy as np
 import numpy.typing as npt
@@ -19,7 +20,10 @@ def spectrogrammify(
 
     beginning_silence = nperseg - noverlap
 
-    sample_rate, samples = wavfile.read(filepath)
+    # print(filepath)
+    with warnings.catch_warnings(action="ignore"):
+        sample_rate, samples = wavfile.read(filepath)
+    # print(filepath)
     if (len(samples.shape) == 2):
         # just one ear
         samples = samples[:, audio_channel]

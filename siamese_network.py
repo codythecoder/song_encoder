@@ -27,7 +27,9 @@ the class segmentation of the training inputs.
 print('importing')
 import os
 import random
-from typing import Callable, Generator, Iterable, Optional, Any, TypeAlias
+from statistics import mean, stdev
+import time
+from typing import Callable, Optional, Any, TypeAlias
 
 import keras
 from keras import ops
@@ -40,6 +42,8 @@ import matplotlib.pyplot as plt
 
 from spectrogrammify import spectrogrammify
 
+from collections import defaultdict
+
 Image_Type: TypeAlias = npt.NDArray[np.float32]
 Raw_Data_Point_Type: TypeAlias = tuple[tuple[Image_Type, Image_Type], int]
 
@@ -48,12 +52,12 @@ Raw_Data_Point_Type: TypeAlias = tuple[tuple[Image_Type, Image_Type], int]
 # Hyperparameters
 #
 
-EPOCHS = 10
-BATCH_SIZE = 16
+EPOCHS = 1
+BATCH_SIZE = 64
 MARGIN = 1  # Margin for contrastive loss.
 LATENT_SPACE = 20
 TRAIN_TEST_SPLIT = 0.8
-MAX_BATCHES_PER_EPOCH = 5000
+STEPS_PER_EPOCH = 5000
 
 AUDIO_FOLDER = 'data/audio'
 
@@ -85,7 +89,7 @@ IMAGE_SIZE = IMAGE_HEIGHT, IMAGE_WIDTH
 # print(IMAGE_WIDTH * SPECTROGRAM_FRAME_GROUPING * SPECTROGRAM_NPERSEG / EXPECTED_BITRATE)
 
 
-
+@keras.saving.register_keras_serializable()
 class PatchScanner(layers.Layer):
     def __init__(
             self,
@@ -109,7 +113,7 @@ class PatchScanner(layers.Layer):
 
         input = keras.layers.Input((*self.patch_size, sample_image_size[2]))
         dense = keras.layers.Flatten()(input)
-        dense = keras.layers.Dense(self.output_height*self.layers, activation='relu')(dense)
+        dense = keras.layers.Dense(self.output_height*self.layers, activation=keras.layers.LeakyReLU(0.1))(dense)
         self.embedding_network = keras.Model(input, dense)
 
     def call(self, x: keras.KerasTensor) -> Any:
@@ -139,7 +143,7 @@ class PatchScanner(layers.Layer):
 def get_audio_files(audio_folder: str = AUDIO_FOLDER) -> list[str]:
     return [
         os.path.join(p, fname)
-        for p, d, f in os.walk(AUDIO_FOLDER)
+        for p, d, f in os.walk(audio_folder)
         for fname in f
         if fname.endswith('.wav')
     ]
@@ -158,9 +162,11 @@ def load_data(
         assert bitrate == EXPECTED_BITRATE
 
     spectrogram = np.array([
-        spectrogram[:,j*seg_length:j*seg_length+seg_length].mean(axis=1)
+        spectrogram[:,j*seg_length:j*seg_length+seg_length].max(axis=1)
         for j in range(len(spectrogram[0])//seg_length)
     ], dtype=np.float64).transpose((1, 0))
+
+    spectrogram /= spectrogram.max()
 
     return spectrogram
 
@@ -179,6 +185,13 @@ class DataGenerator(keras.utils.PyDataset):
             ) -> None:
         super().__init__()
 
+        if len(filenames) < 2:
+            raise ValueError('minimum 2 files must be provided')
+        if num_active_files < 2:
+            raise ValueError('minimum 2 files must be active')
+        if len(filenames) < num_active_files:
+            raise ValueError('not enough files provided for num_active_files')
+
         self.all_filenames = filenames
         self.batch_size = batch_size
         self.dim = dim
@@ -194,22 +207,22 @@ class DataGenerator(keras.utils.PyDataset):
 
         self.curr_filename_index = 0
 
-        self.spectrogram_lengths = {
-            fname: MAX_BATCHES_PER_EPOCH
+        self.spectrogram_lengths: dict[str, int] = {
+            fname: STEPS_PER_EPOCH
             for fname in self.all_filenames
         }
 
         self.on_epoch_end()
 
-        while len(self.active_filenames) < self.num_active_files:
-            self._load_one_spectrogram()
 
     def __len__(self) -> int:
         'Denotes the number of batches per epoch'
-        return min(
-            MAX_BATCHES_PER_EPOCH,
-            sum(self.spectrogram_lengths.values()) // self.batch_size
-        )
+        return int((
+            sum(self.spectrogram_lengths.values())
+            - mean(self.spectrogram_lengths.values()) * 2
+            - self.data_width * len(self.spectrogram_lengths)
+        ) // self.batch_size)
+
 
     def __getitem__(
             self,
@@ -280,6 +293,7 @@ class DataGenerator(keras.utils.PyDataset):
         self.active_spectrograms[filename_to_get] = spectrogram
         self.active_spectrogram_queues[filename_to_get] = list(range(spectrogram.shape[1]-self.data_width))
         random.shuffle(self.active_spectrogram_queues[filename_to_get])
+        self.active_spectrogram_queues[filename_to_get] = self.active_spectrogram_queues[filename_to_get][:1000]
 
         self.spectrogram_lengths[filename_to_get] = len(self.active_spectrogram_queues[filename_to_get])
         self.curr_filename_index += 1
@@ -297,6 +311,14 @@ class DataGenerator(keras.utils.PyDataset):
     def on_epoch_end(self) -> None:
         random.shuffle(self.all_filenames)
         self.curr_filename_index = 0
+
+        self.active_spectrograms = {}
+        self.active_spectrogram_queues = {}
+        self.active_filenames = []
+
+        while len(self.active_filenames) < self.num_active_files:
+            self._load_one_spectrogram()
+
         return None
 
 
@@ -451,16 +473,21 @@ def plt_metric(history, metric, title, has_valid=True):
 
 
 
-
+print('preparing data')
 input_filepaths = get_audio_files(AUDIO_FOLDER)
 random.shuffle(input_filepaths)
-train_filepaths = input_filepaths[:int(len(input_filepaths)*TRAIN_TEST_SPLIT)]
-test_filepaths = [fpath for fpath in input_filepaths if fpath not in train_filepaths]
+# input_filepaths = input_filepaths[:10]
+max_test = min(
+    int(len(input_filepaths)*(1-TRAIN_TEST_SPLIT)),
+    20
+)
+test_filepaths = input_filepaths[:max_test]
+train_filepaths = [fpath for fpath in input_filepaths if fpath not in test_filepaths]
 
 train_data = DataGenerator(
     train_filepaths,
     IMAGE_WIDTH,
-    num_active_files=5,
+    num_active_files=15,
 )
 test_data = DataGenerator(
     test_filepaths,
@@ -520,9 +547,9 @@ siamese = keras.Model(inputs=[input_1, input_2], outputs=output_layer)
 ## Compile the model with the contrastive loss
 """
 
-siamese.compile(loss=loss(margin=MARGIN), optimizer="RMSprop", metrics=["accuracy"])
-embedding_network.summary()
+siamese.compile(loss=keras.losses.MeanSquaredError(), optimizer="RMSprop", metrics=["accuracy"])
 siamese.summary()
+embedding_network.summary()
 
 
 """
@@ -534,11 +561,16 @@ print('training on', len(train_filepaths), 'songs')
 print('testing on', len(test_filepaths), 'songs')
 print()
 
+checkpoint = keras.callbacks.ModelCheckpoint('checkpoint_{epoch:02d}.keras', save_freq='epoch')
 history = siamese.fit(
     x=train_data,
     validation_data=test_data,
     batch_size=BATCH_SIZE,
+    steps_per_epoch=STEPS_PER_EPOCH,
+    validation_steps=300,
     epochs=EPOCHS,
+    shuffle=False,
+    callbacks=[checkpoint],
 )
 
 siamese.save('out.keras')
@@ -547,23 +579,79 @@ siamese.save('out.keras')
 ## Visualize results
 """
 
+def i_am_confusion(
+        filenames: list[str],
+        batch_size: int = 64,
+        samples_per_song: int = 5000,
+        ) -> tuple[
+            dict[str, dict[str, float]],
+            dict[str, dict[str, float]]]:
+    """
+    >>> result = i_am_confusion(filenames)
+    >>> z = result[x][y]
+    """
+    batch_predictions: npt.NDArray[np.float32]
+    batch: tuple[list[npt.NDArray[np.float32]], list[npt.NDArray[np.float32]]]
+    confusion: dict[str, dict[str, float]]
+    confidence: dict[str, dict[str, float]]
 
-# Plot the accuracy
-plt_metric(history=history.history, metric="accuracy", title="Model accuracy")
+    confusion = defaultdict(dict)
+    confidence = defaultdict(dict)
+    for i, filename1 in enumerate(filenames):
+        spectrogram1 = load_data(
+            filename1, SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING
+            ).astype(np.float32)
+        for j, filename2 in enumerate(filenames[i:]):
+            print(f'{100*(i+j/(len(filenames)-i))/len(filenames): >6.2f}%', end='\b'*7, flush=True)
+            spectrogram2 = load_data(
+                filename2, SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING
+                ).astype(np.float32)
+            preds: list[float] = []
+            batch = ([], [])
+            for _ in range(samples_per_song):
+                idx1 = random.randrange(spectrogram1.shape[1]-IMAGE_WIDTH)
+                idx2 = random.randrange(spectrogram2.shape[1]-IMAGE_WIDTH)
+                image1 = spectrogram1[:,idx1:idx1+IMAGE_WIDTH]
+                image2 = spectrogram2[:,idx2:idx2+IMAGE_WIDTH]
+                batch[0].append(image1)
+                batch[1].append(image2)
+                if len(batch[0]) == batch_size:
+                    batch_predictions = siamese.predict([np.array(batch[0]),np.array(batch[1])],verbose=0)
+                    preds.extend(batch_predictions[:,0].tolist())
+                    batch = ([], [])
+            if batch[0]:
+                batch_predictions = siamese.predict([np.array(batch[0]),np.array(batch[1])],verbose=0)
+                preds.extend(batch_predictions[:,0].tolist())
+            confusion[filename1][filename2] = mean(preds)
+            confidence[filename1][filename2] = stdev(preds)
+    print('100.00%')
+    return confusion, confidence
 
-# Plot the contrastive loss
-plt_metric(history=history.history, metric="loss", title="Contrastive Loss")
 
-"""
-## Evaluate the model
-"""
+def print_matrix(matrix: dict[str, dict[str, float]]) -> None:
+    def fix_name(name: str) -> str:
+        name = name.removeprefix('data/audio\\').removesuffix('.wav')
+        name = name.replace(',', ' &')
+        return name
+    rows = list(matrix.keys())
+    print(',' + ','.join(fix_name(r) for r in rows))
+    for row in rows:
+        print(f'{fix_name(row)},' + ','.join(str(matrix[row][col]) if col in matrix[row] else "" for col in rows))
 
-results = siamese.evaluate([x_test_1, x_test_2], labels_test)
-print("test loss, test acc:", results)
-
-"""
-## Visualize the predictions
-"""
-
-predictions = siamese.predict([x_test_1, x_test_2])
-visualize(pairs_test, labels_test, to_show=3, predictions=predictions, test=True)
+a = i_am_confusion(test_filepaths[:20], batch_size=400, samples_per_song=3000)
+print()
+print("test confusion")
+print_matrix(a[0])
+print()
+print()
+print("test confidence")
+print_matrix(a[1])
+print()
+print()
+b = i_am_confusion(train_filepaths[:20], batch_size=400, samples_per_song=3000)
+print("train confusion")
+print_matrix(b[0])
+print()
+print()
+print("train confidence")
+print_matrix(b[1])
