@@ -109,56 +109,6 @@ config: Config_Type = {
     'IMAGE_SIZE':IMAGE_SIZE,
 }
 
-@keras.saving.register_keras_serializable()
-class PatchScanner(layers.Layer):  # type: ignore
-    def __init__(
-            self,
-            patch_width: int,
-            image_shape: tuple[int | None, ...],
-            output_size: int | None,
-            strides: Optional[int | tuple[int, int]] = None,
-            layers: int = 1,
-            **kwargs: dict[Any, Any]) -> None:
-        super().__init__(**kwargs)
-        sample_image_size: tuple[int | None, int | None, int | None] = (
-            image_shape[1],
-            image_shape[2],
-            image_shape[3] if len(image_shape) >= 4 else 1
-        )
-        self.patch_size = (sample_image_size[0], patch_width)
-        self.strides = strides
-        self.layers = layers
-        self.output_height: int | None = output_size or sample_image_size[0]
-
-
-        input = keras.layers.Input((*self.patch_size, sample_image_size[2]))
-        dense = keras.layers.Flatten()(input)
-        dense = keras.layers.Dense(self.output_height*self.layers, activation=keras.layers.LeakyReLU(0.1))(dense)
-        self.embedding_network = keras.Model(input, dense)
-
-    def call(self, x: keras.KerasTensor) -> Any:
-        # create patch virtulisation
-        patches = keras.ops.image.extract_patches(x, self.patch_size, strides=self.strides)
-        batch_size = keras.ops.shape(patches)[0]
-        num_patches = keras.ops.shape(patches)[1] * keras.ops.shape(patches)[2]
-        num_dims = x.shape[-1]
-        patches = keras.ops.reshape(patches, (batch_size, num_patches, *self.patch_size, num_dims))
-        patches = keras.ops.transpose(patches, axes=(0, 2, 3, 4, 1))
-
-        # fully connected layer factory
-        y = keras.ops.unstack(
-            patches, num=None, axis=-1
-        )
-
-        outputs = [
-            layers.Reshape((self.output_height, 1, self.layers))(self.embedding_network(layer))
-            for layer in y
-        ]
-
-        output = layers.Concatenate(2)(outputs)
-
-        return output
-
 # Provided two tensors t1 and t2
 # Euclidean distance = sqrt(sum(square(t1-t2)))
 def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> Any:
@@ -257,56 +207,65 @@ test_data = DataGenerator(
 )
 
 
-"""
-## Define the model
+def build_embedded_network(model_name: str = 'embedding_network') -> keras.Model:
+    embedding_network = keras.Sequential([
+        keras.layers.Input((*IMAGE_SIZE, 1)),
+        keras.layers.BatchNormalization(),
 
-There are two input layers, each leading to its own network, which
-produces embeddings. A `Lambda` layer then merges them using an
-[Euclidean distance](https://en.wikipedia.org/wiki/Euclidean_distance) and the
-merged output is fed to the final network.
-"""
+        keras.layers.Conv2D(4, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
+        keras.layers.MaxPooling2D(pool_size=(2, 3)),
+        keras.layers.Dropout(0.1),
 
+        keras.layers.Conv2D(8, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
+        keras.layers.MaxPooling2D(pool_size=(1, 2)),
+        keras.layers.Dropout(0.1),
 
-input = keras.layers.Input((*IMAGE_SIZE, 1))
-x = keras.layers.BatchNormalization()(input)
-x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
-x = PatchScanner(6, x.shape, strides=6, layers=2, output_size=IMAGE_SIZE[0]//2)(x)
-x = PatchScanner(4, x.shape, strides=2, layers=5, output_size=IMAGE_SIZE[0]//2)(x)
-x = PatchScanner(4, x.shape, strides=1, layers=10, output_size=IMAGE_SIZE[0]//2)(x)
-x = PatchScanner(4, x.shape, strides=2, layers=10, output_size=IMAGE_SIZE[0]//4)(x)
-# x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
-# x = keras.layers.Conv2D(16, (5, 5), activation="tanh")(x)
-# x = keras.layers.AveragePooling2D(pool_size=(2, 2))(x)
-x = keras.layers.Flatten()(x)
-x = keras.layers.BatchNormalization()(x)
+        keras.layers.Conv2D(16, (5, 7), activation=keras.layers.LeakyReLU(0.1)),
+        keras.layers.MaxPooling2D(pool_size=(1, 2)),
+        keras.layers.Dropout(0.1),
 
-x = keras.layers.Dense(500, activation="relu")(x)
-x = keras.layers.Dense(100, activation="relu")(x)
-x = keras.layers.Dense(LATENT_SPACE, activation="tanh")(x)
+        keras.layers.Conv2D(24, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Dropout(0.2),
 
-embedding_network = keras.Model(input, x)
+        keras.layers.Flatten(),
+        keras.layers.BatchNormalization(),
 
+        keras.layers.Dense(250, activation=keras.layers.LeakyReLU(0.1)),
+        keras.layers.Dropout(0.3),
+        keras.layers.Dense(200, activation=keras.layers.LeakyReLU(0.1)),
+        keras.layers.Dropout(0.3),
+        keras.layers.Dense(100, activation="tanh"),
+        keras.layers.Dropout(0.3),
 
-input_1 = keras.layers.Input((*IMAGE_SIZE, 1))
-input_2 = keras.layers.Input((*IMAGE_SIZE, 1))
+        keras.layers.Dense(LATENT_SPACE, activation="tanh"),
+    ])
 
-# As mentioned above, Siamese Network share weights between
-# tower networks (sister networks). To allow this, we will use
-# same embedding network for both tower networks.
-tower_1 = embedding_network(input_1)
-tower_2 = embedding_network(input_2)
-
-merge_layer = keras.layers.Lambda(euclidean_distance, output_shape=(1,))(
-    [tower_1, tower_2]
-)
-normal_layer = keras.layers.BatchNormalization()(merge_layer)
-output_layer = keras.layers.Dense(1, activation="sigmoid")(normal_layer)
-siamese = keras.Model(inputs=[input_1, input_2], outputs=output_layer)
+    return embedding_network
 
 
-"""
-## Compile the model with the contrastive loss
-"""
+def build_siamese_model(embedding_network: keras.Model) -> keras.Model:
+    input_1 = keras.layers.Input((*IMAGE_SIZE, 1))
+    input_2 = keras.layers.Input((*IMAGE_SIZE, 1))
+
+    # As mentioned above, Siamese Network share weights between
+    # tower networks (sister networks). To allow this, we will use
+    # same embedding network for both tower networks.
+    tower_1 = embedding_network(input_1)
+    tower_2 = embedding_network(input_2)
+
+    merge_layer = keras.layers.Lambda(euclidean_distance, output_shape=(1,))(
+        [tower_1, tower_2]
+    )
+    normal_layer = keras.layers.BatchNormalization()(merge_layer)
+    output_layer = keras.layers.Dense(1, activation="sigmoid")(normal_layer)
+    siamese = keras.Model(inputs=[input_1, input_2], outputs=output_layer)
+
+    return siamese
+
+
+embedding_network = build_embedded_network()
+siamese = build_siamese_model(embedding_network)
 
 siamese.compile(loss=keras.losses.MeanSquaredError(), optimizer="RMSprop", metrics=["accuracy"])
 siamese.summary()
