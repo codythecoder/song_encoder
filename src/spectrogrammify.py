@@ -47,30 +47,3 @@ def spectrogrammify(
 
     return sample_rate, frequencies, times[1:], spectrogram[:,1:]
 
-
-
-if __name__ == '__main__':
-    import matplotlib.pyplot as plt
-    filepath = r'13. rain mist, snow mist, fire that follows-v04.wav'
-    frequencies, times, spectrogram = spectrogrammify(filepath, nperseg=1024)
-    times = times[:1000]
-    spectrogram = spectrogram[:,:1000]
-
-    import sys
-    np.set_printoptions(threshold=sys.maxsize)
-
-    # Sxx = spectrogram
-    Sxx = 10*np.log10(spectrogram)
-
-    plt.pcolormesh(times, frequencies, Sxx)
-    # plt.pcolormesh(times, frequencies, spectrogram)
-    ax = plt.gca()
-    ax.set_aspect('equal', adjustable='box')
-    # ax.set_yscale('symlog')
-    # plt.axis('scaled')
-    # plt.imshow(spectrogram, extent=(min(times),max(times),max(frequencies),min(frequencies)), aspect='auto')
-    plt.imshow(Sxx, extent=(min(times),max(times),max(frequencies),min(frequencies)), aspect='auto', )
-    plt.ylabel('Frequency [Hz]')
-    plt.xlabel('Time [sec]')
-    plt.show()
-    plt.waitforbuttonpress()
