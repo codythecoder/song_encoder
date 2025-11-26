@@ -34,8 +34,11 @@ from keras import ops
 import numpy as np
 from numpy import typing as npt
 
-from src.data import DataGenerator, get_audio_files, load_data
-from src.post_processing import i_am_confusion, print_matrix
+import yaml
+
+from src.data import DataGenerator, get_audio_files
+from src.encoder_types import Config
+from src.post_processing import calculate_similarity_matrix, get_song_encodings, print_matrix
 
 
 
@@ -56,25 +59,12 @@ STEPS_PER_EPOCH = 3000
 # but if this is too long, it takes too long to load
 SAMPLES_PER_SONG_LOAD = 1000
 
-AUDIO_FOLDER = 'data/audio'
+AUDIO_FOLDER = r'D:\song_encoder\audio'
 
-# don't process any file that uses a different bitrate
-EXPECTED_BITRATE = 44100
-# the raw window to calculate the spectrogram over (as a section of the bitrate)
-#   changing this will also change the number of frequency buckets returned from scipy
-SPECTROGRAM_NPERSEG = 128
-# number of raw spectrogram frames to average over
-#   nperseg will change the
-SPECTROGRAM_FRAME_GROUPING = 12  # ~1500 from bitrate
-# how many frames to input to the learning model
-IMAGE_WIDTH = 360  # ~13 seconds
-
-# i'm so sorry
-#   you gotta find this by trial and error
-# IMAGE_HEIGHT = load_data('file.wav', SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING).shape[0]
-IMAGE_HEIGHT = 65
-
-IMAGE_SIZE = IMAGE_HEIGHT, IMAGE_WIDTH
+CONFIG: Config = yaml.load(
+    open('config.yaml'),
+    yaml.Loader,
+)
 
 ##### HERE'S THE OUTPUTS THAT MATTER TO YOU #####
 # data input rate = (EXPECTED_BITRATE / SPECTROGRAM_FRAME_GROUPING) frames per second
@@ -124,36 +114,11 @@ def pre_loss(vects: tuple[keras.KerasTensor, keras.KerasTensor, keras.KerasTenso
     return output
 
 
-def get_song_encodings(filename: str, batch_size: int = 64) -> npt.NDArray[np.float32]:
-    spectrogram = load_data(
-        filename, SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING
-        ).astype(np.float32)
-
-    end_idx = spectrogram.shape[1]-IMAGE_WIDTH
-    preds = np.empty((end_idx, LATENT_SPACE), dtype=np.float32)
-
-    for idx in range(0, end_idx, batch_size):
-        curr_end_idx = min(idx+batch_size, end_idx)
-        batch = [
-            spectrogram[:, i:i+IMAGE_WIDTH]
-            for i in range(idx, curr_end_idx)
-        ]
-
-        new_preds = embedded_model.predict(
-            np.array(batch),
-            verbose=0,
-        )
-
-        preds[idx:curr_end_idx] = new_preds
-
-    return preds
-
-
 
 def build_embedded_network(model_name: str = 'embedding_network') -> keras.Model:
     embedding_network = keras.Sequential(
         [
-            keras.layers.Input((*IMAGE_SIZE, 1)),
+            keras.layers.Input((CONFIG['IMAGE_HEIGHT'], CONFIG['IMAGE_WIDTH'], 1)),
             keras.layers.BatchNormalization(),
 
             keras.layers.Conv2D(4, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
@@ -191,9 +156,9 @@ def build_embedded_network(model_name: str = 'embedding_network') -> keras.Model
 
 
 def build_siamese_model(embedding_network: keras.Model) -> keras.Model:
-    input_1 = keras.layers.Input((*IMAGE_SIZE, 1))
-    input_2 = keras.layers.Input((*IMAGE_SIZE, 1))
-    input_3 = keras.layers.Input((*IMAGE_SIZE, 1))
+    input_1 = keras.layers.Input((CONFIG['IMAGE_HEIGHT'], CONFIG['IMAGE_WIDTH'], 1))
+    input_2 = keras.layers.Input((CONFIG['IMAGE_HEIGHT'], CONFIG['IMAGE_WIDTH'], 1))
+    input_3 = keras.layers.Input((CONFIG['IMAGE_HEIGHT'], CONFIG['IMAGE_WIDTH'], 1))
 
     # As mentioned above, Siamese Network share weights between
     # tower networks (sister networks). To allow this, we will use
@@ -216,6 +181,11 @@ def build_siamese_model(embedding_network: keras.Model) -> keras.Model:
 print('preparing data')
 input_filepaths = get_audio_files(AUDIO_FOLDER)
 
+# from scipy.io import wavfile
+# for f in list(input_filepaths):
+#     if wavfile.read(f)[0] != CONFIG['EXPECTED_BITRATE']:
+#         input_filepaths.remove(f)
+
 random.shuffle(input_filepaths)
 
 max_test = min(
@@ -229,21 +199,15 @@ train_filepaths = input_filepaths[max_test:]
 
 train_data = DataGenerator(
     train_filepaths,
-    IMAGE_WIDTH,
+    CONFIG,
     batch_size=BATCH_SIZE,
-    dim=IMAGE_SIZE,
-    spectrogram_nperseg=SPECTROGRAM_NPERSEG,
-    spectrogram_frame_grouping=SPECTROGRAM_FRAME_GROUPING,
     samples_per_song_load=SAMPLES_PER_SONG_LOAD,
     num_active_files=15,
 )
 test_data = DataGenerator(
     test_filepaths,
-    IMAGE_WIDTH,
+    CONFIG,
     batch_size=BATCH_SIZE,
-    dim=IMAGE_SIZE,
-    spectrogram_nperseg=SPECTROGRAM_NPERSEG,
-    spectrogram_frame_grouping=SPECTROGRAM_FRAME_GROUPING,
     samples_per_song_load=SAMPLES_PER_SONG_LOAD,
     num_active_files=2,
 )
@@ -265,7 +229,7 @@ if LOAD_FROM_FILE is None:
     print('testing on', len(test_filepaths), 'songs')
     print()
 
-    checkpoint = keras.callbacks.ModelCheckpoint('checkpoint_{epoch:02d}.keras', save_freq='epoch')
+    checkpoint = keras.callbacks.ModelCheckpoint('out/models/checkpoint_{epoch:02d}.keras', save_freq='epoch')
     history = siamese.fit(
         x=train_data,
         validation_data=test_data,
@@ -280,7 +244,8 @@ if LOAD_FROM_FILE is None:
     embedded_layer = siamese.get_layer('embedding_network')
     embedded_model = keras.Model(inputs = embedded_layer.input, outputs = embedded_layer.output)
 
-    embedded_model.save('out.keras')
+    embedded_model.save('out/models/out.keras')
+
 else:
     embedded_model = keras.saving.load_model(LOAD_FROM_FILE)
 
@@ -291,9 +256,9 @@ encodings = {}
 
 for i, filename in enumerate(all_filepaths):
     print(f'{100*i/len(all_filepaths): >6.2f}%', end='\b'*7, flush=True)
-    encodings[filename] = get_song_encodings(filename, 400)
+    encodings[filename] = get_song_encodings(embedded_model, filename, CONFIG, 400)
 
-a = i_am_confusion(
+a = calculate_similarity_matrix(
     encodings,
     test_filepaths[:20],
     samples_per_song=3000,
@@ -304,7 +269,7 @@ print_matrix(a, 'avg_from_mean')
 print()
 print()
 
-b = i_am_confusion(
+b = calculate_similarity_matrix(
     encodings,
     train_filepaths[:20],
     samples_per_song=3000,
@@ -315,7 +280,7 @@ print_matrix(b, 'avg_from_mean')
 print()
 print()
 
-c = i_am_confusion(
+c = calculate_similarity_matrix(
     encodings,
     all_filepaths,
     samples_per_song=1500,

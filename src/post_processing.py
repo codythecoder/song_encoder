@@ -1,19 +1,26 @@
 from collections import defaultdict
 import random
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import numpy.typing as npt
 
+import keras
+
+from src.data import load_data
+
+from src.encoder_types import Config, Similarity_Matrix
 
 
-def i_am_confusion(
+
+def calculate_similarity_matrix(
         encodings: dict[str, npt.NDArray[np.float32]],
         filenames: Optional[list[str]] = None,
         samples_per_song: int = 5000,
-        ) -> dict[str, dict[str,  dict[str, float]]]:
+        ) -> Similarity_Matrix:
+
     batch: tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]
-    confusion: dict[str, dict[str,  dict[str, float]]]
+    confusion: Similarity_Matrix
 
     if filenames is None:
         filenames = list(encodings.keys())
@@ -45,14 +52,42 @@ def i_am_confusion(
     return confusion
 
 
-def print_matrix(matrix: dict[str, dict[str,  dict[str, float]]], key: str) -> None:
-    def fix_name(name: str) -> str:
-        name = name.removeprefix('data/audio\\').removesuffix('.wav')
-        name = name.replace(',', ' &')
-        return name
+def __fix_name(name: str) -> str:
+    # get just the filename
+    name = name.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+    # remove filetype
+    name = name.rsplit('.', 1)[-1]
+    name = name.replace(',', ' &')
+    return name
 
+
+def print_matrix(matrix: Similarity_Matrix, key: Literal['dist_mean'] | Literal['avg_from_mean']) -> None:
     rows = list(matrix.keys())
 
-    print(',' + ','.join(fix_name(r) for r in rows))
+    print(',' + ','.join(__fix_name(r) for r in rows))
     for row in rows:
-        print(f'{fix_name(row)},' + ','.join(str(matrix[row][col][key]) for col in rows))
+        print(f'{__fix_name(row)},' + ','.join(str(matrix[row][col][key]) for col in rows))
+
+
+def get_song_encodings(embedded_model: keras.Model, filename: str, config: Config, batch_size: int = 64) -> npt.NDArray[np.float32]:
+    spectrogram = load_data(filename, config).astype(np.float32)
+
+    end_idx = spectrogram.shape[1]-config['IMAGE_WIDTH']
+    preds = np.empty((end_idx, config['LATENT_SPACE']), dtype=np.float32)
+
+    for idx in range(0, end_idx, batch_size):
+        curr_end_idx = min(idx+batch_size, end_idx)
+        batch = [
+            spectrogram[:, i:i+config['IMAGE_WIDTH']]
+            for i in range(idx, curr_end_idx)
+        ]
+
+        new_preds = embedded_model.predict(
+            np.array(batch),
+            verbose=0,
+        )
+
+        preds[idx:curr_end_idx] = new_preds
+
+    return preds
+

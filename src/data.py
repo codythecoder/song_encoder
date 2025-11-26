@@ -8,7 +8,7 @@ import numpy.typing as npt
 
 import keras
 
-from src.encoder_types import Raw_Data_Point_Type
+from src.encoder_types import Raw_Data_Point_Type, Config
 
 from src.spectrogrammify import spectrogrammify
 
@@ -19,22 +19,18 @@ def get_audio_files(audio_folder: str) -> list[str]:
         for p, d, f in os.walk(audio_folder)
         for fname in f
         if fname.endswith('.wav')
+        or fname.endswith('.mp3')
     ]
 
 
 def load_data(
         filepath: str,
-        nperseg: int = 256,
-        seg_length: int = 1,
-        expected_bitrate: int = 44100,
+        config: Config,
         ) -> npt.NDArray[np.float64]:
 
-    bitrate, _, _, spectrogram = spectrogrammify(filepath, nperseg=nperseg)
-    if bitrate != expected_bitrate:
-        print(bitrate)
-        print(filepath)
-        assert bitrate == expected_bitrate
+    spectrogram = spectrogrammify(filepath, config)
 
+    seg_length = config['SPECTROGRAM_FRAME_GROUPING']
     spectrogram = np.array([
         spectrogram[:,j*seg_length:j*seg_length+seg_length].max(axis=1)
         for j in range(len(spectrogram[0])//seg_length)
@@ -49,11 +45,8 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
     def __init__(
             self,
             filenames: list[str],
-            data_width: int,
+            config: Config,
             batch_size: int,
-            dim: tuple[int, ...],
-            spectrogram_nperseg: int,
-            spectrogram_frame_grouping: int,
             num_active_files: int = 2,
             margin: int = 1,
             samples_per_song_load: Optional[int] = None
@@ -69,13 +62,14 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
             raise ValueError('not enough files provided for num_active_files')
 
         self.all_filenames = filenames
+        self.config = config
         self.batch_size = batch_size
-        self.dim = dim
-        self.data_width = data_width
+        self.dim = config['IMAGE_HEIGHT'], config['IMAGE_WIDTH']
+        self.data_width = config['IMAGE_WIDTH']
         self.num_active_files = num_active_files
         self.difference_value = margin
-        self.spectrogram_nperseg = spectrogram_nperseg
-        self.spectrogram_frame_grouping = spectrogram_frame_grouping
+        self.spectrogram_nperseg = config['SPECTROGRAM_NPERSEG']
+        self.spectrogram_frame_grouping = config['SPECTROGRAM_FRAME_GROUPING']
         self.samples_per_song_load = samples_per_song_load
 
         self.active_spectrograms: dict[str, npt.NDArray[np.float32]] = {}
@@ -200,9 +194,7 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
         # print('loading', filename_to_get)
         self.active_filenames.append(filename_to_get)
         spectrogram: npt.NDArray[np.float32]
-        spectrogram = load_data(
-            filename_to_get, self.spectrogram_nperseg, self.spectrogram_frame_grouping
-            ).astype(np.float32)
+        spectrogram = load_data(filename_to_get, self.config).astype(np.float32)
         self.active_spectrograms[filename_to_get] = spectrogram
         self.active_spectrogram_queues[filename_to_get] = list(range(spectrogram.shape[1]-self.data_width))
         random.shuffle(self.active_spectrogram_queues[filename_to_get])

@@ -1,0 +1,16 @@
+
+# don't process any file that uses a different bitrate
+EXPECTED_BITRATE: 44100
+# the raw window to calculate the spectrogram over (as a section of the bitrate)
+#   changing this will also change the number of frequency buckets returned from scipy
+SPECTROGRAM_NPERSEG: 128
+# number of raw spectrogram frames to average over
+#   nperseg will change the
+SPECTROGRAM_FRAME_GROUPING: 12  # ~1500 from bitrate
+# how many frames to input to the learning model
+IMAGE_WIDTH: 360  # ~13 seconds
+
+# i'm so sorry
+#   you gotta find this by trial and error
+# IMAGE_HEIGHT: load_data('file.wav', SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING).shape[0]
+IMAGE_HEIGHT: 65
