@@ -8,7 +8,7 @@ import numpy.typing as npt
 
 import keras
 
-from src.encoder_types import Config_Type, Raw_Data_Point_Type
+from src.encoder_types import Raw_Data_Point_Type
 
 from src.spectrogrammify import spectrogrammify
 
@@ -116,6 +116,7 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
                 tuple[
                     npt.NDArray[np.float32],
                     npt.NDArray[np.float32],
+                    npt.NDArray[np.float32],
                 ],
                 npt.NDArray[np.float32],
             ]:
@@ -124,26 +125,27 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
         # Initialization
         x1 = np.empty((self.batch_size, *self.dim), dtype=np.float32)
         x2 = np.empty((self.batch_size, *self.dim), dtype=np.float32)
-        y = np.empty((self.batch_size,), dtype=np.float32)
+        x3 = np.empty((self.batch_size, *self.dim), dtype=np.float32)
+        y = np.zeros((self.batch_size,2), dtype=np.float32)
+        y[:,1] = self.difference_value
 
         # Generate data
         for i in range(self.batch_size):
             assert len(self.active_filenames) >= 2
             assert sorted(self.active_filenames) == sorted(self.active_spectrogram_queues)
             assert sorted(self.active_filenames) == sorted(self.active_spectrograms)
-            (in1, in2), out = self._get_one()
+            in1, in2, in3 = self._get_one()
 
             # Store sample
             x1[i] = in1
             x2[i] = in2
+            x3[i] = in3
 
-            # Store class
-            y[i] = out
         assert len(self.active_filenames) >= 2
         assert sorted(self.active_filenames) == sorted(self.active_spectrogram_queues)
         assert sorted(self.active_filenames) == sorted(self.active_spectrograms)
 
-        return (x1, x2), y
+        return (x1, x2, x3), y
 
     def _get_one(self) -> Raw_Data_Point_Type:
         # print('_get_one')
@@ -151,38 +153,22 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
         assert sorted(self.active_filenames) == sorted(self.active_spectrogram_queues)
         assert sorted(self.active_filenames) == sorted(self.active_spectrograms)
 
-        if random.randrange(2):
-            # same
-            filename = random.choice(self.active_filenames)
-            idx1 = self.active_spectrogram_queues[filename].pop(0)
-            idx2 = self.active_spectrogram_queues[filename].pop(0)
-            sample1 = self.active_spectrograms[filename][:,idx1:idx1+self.data_width]
-            sample2 = self.active_spectrograms[filename][:,idx2:idx2+self.data_width]
-            result = 0
-            self._delete_if_empty(filename)
-        else:
-            # different
-            filename1, filename2 = random.sample(self.active_filenames, 2)
-            assert filename1 != filename2
-            idx1 = self.active_spectrogram_queues[filename1].pop(0)
-            idx2 = self.active_spectrogram_queues[filename2].pop(0)
-            sample1 = self.active_spectrograms[filename1][:,idx1:idx1+self.data_width]
-            sample2 = self.active_spectrograms[filename2][:,idx2:idx2+self.data_width]
-            result = self.difference_value
-            if filename1 == filename2:
-                raise Exception
-            # else:
-            #     print('a')
-            self._delete_if_empty(filename1)
-            self._delete_if_empty(filename2)
+        filename1, filename2 = random.sample(self.active_filenames, 2)
+        idx1 = self.active_spectrogram_queues[filename1].pop(0)
+        idx2 = self.active_spectrogram_queues[filename1].pop(0)
+        idx3 = self.active_spectrogram_queues[filename2].pop(0)
+        sample1 = self.active_spectrograms[filename1][:,idx1:idx1+self.data_width]
+        sample2 = self.active_spectrograms[filename1][:,idx2:idx2+self.data_width]
+        sample3 = self.active_spectrograms[filename2][:,idx3:idx3+self.data_width]
 
-
+        self._delete_if_empty(filename1)
+        self._delete_if_empty(filename2)
 
         assert len(self.active_filenames) >= 2
         assert sorted(self.active_filenames) == sorted(self.active_spectrogram_queues)
         assert sorted(self.active_filenames) == sorted(self.active_spectrograms)
 
-        return (sample1, sample2), result
+        return sample1, sample2, sample3
 
     def _load_one_spectrogram(self) -> None:
         # print('_load_one_spectrogram')
@@ -228,9 +214,9 @@ class DataGenerator(keras.utils.PyDataset):  # type: ignore
         self.curr_filename_index += 1
         self.curr_filename_index %= len(self.all_filenames)
 
-        assert self.active_filenames
-        assert sorted(self.active_filenames) == sorted(self.active_spectrogram_queues)
-        assert sorted(self.active_filenames) == sorted(self.active_spectrograms)
+        # assert self.active_filenames
+        # assert sorted(self.active_filenames) == sorted(self.active_spectrogram_queues)
+        # assert sorted(self.active_filenames) == sorted(self.active_spectrograms)
 
     def _delete_if_empty(self, filename: str) -> None:
         # print('_delete_if_empty')

@@ -26,20 +26,16 @@ the class segmentation of the training inputs.
 
 print('importing')
 import random
-from typing import Callable, Any, Optional
+from typing import Any
 
 import keras
 from keras import ops
-from keras import layers
 
 import numpy as np
 from numpy import typing as npt
 
-from src.data import DataGenerator, get_audio_files
+from src.data import DataGenerator, get_audio_files, load_data
 from src.post_processing import i_am_confusion, print_matrix
-
-
-from src.encoder_types import Config_Type
 
 
 
@@ -49,7 +45,7 @@ LOAD_FROM_FILE: None | str = None
 # Hyperparameters
 #
 
-EPOCHS = 1
+EPOCHS = 20
 BATCH_SIZE = 64
 MARGIN = 1  # Margin for contrastive loss.
 LATENT_SPACE = 20
@@ -92,26 +88,11 @@ IMAGE_SIZE = IMAGE_HEIGHT, IMAGE_WIDTH
 # OTHER IMPORTANT VALUES
 # MAX_EUCLIDEAN_DISTANCE = (4*LATENT_SPACE)**0.5
 
-config: Config_Type = {
-    'EPOCHS':EPOCHS,
-    'BATCH_SIZE':BATCH_SIZE,
-    'MARGIN':MARGIN,
-    'LATENT_SPACE':LATENT_SPACE,
-    'TRAIN_TEST_SPLIT':TRAIN_TEST_SPLIT,
-    'STEPS_PER_EPOCH':STEPS_PER_EPOCH,
-    'SAMPLES_PER_SONG_LOAD':SAMPLES_PER_SONG_LOAD,
-    'AUDIO_FOLDER':AUDIO_FOLDER,
-    'EXPECTED_BITRATE':EXPECTED_BITRATE,
-    'SPECTROGRAM_NPERSEG':SPECTROGRAM_NPERSEG,
-    'SPECTROGRAM_FRAME_GROUPING':SPECTROGRAM_FRAME_GROUPING,
-    'IMAGE_WIDTH':IMAGE_WIDTH,
-    'IMAGE_HEIGHT':IMAGE_HEIGHT,
-    'IMAGE_SIZE':IMAGE_SIZE,
-}
+
 
 # Provided two tensors t1 and t2
 # Euclidean distance = sqrt(sum(square(t1-t2)))
-def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> Any:
+def euclidean_distance(x: keras.KerasTensor, y: keras.KerasTensor) -> Any:
     """Find the Euclidean distance between two vectors.
 
     Arguments:
@@ -122,9 +103,8 @@ def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> An
         (as floating point value) between vectors.
     """
 
-    x, y = vects
     sum_square = ops.sum(ops.square(x - y), axis=1, keepdims=True)
-    return ops.sqrt(ops.maximum(sum_square, keras.backend.epsilon()))
+    return ops.sqrt(sum_square)
 
 
 """
@@ -132,58 +112,120 @@ def euclidean_distance(vects: tuple[keras.KerasTensor, keras.KerasTensor]) -> An
 """
 
 
-def loss(margin: float = MARGIN) -> Callable[..., Any]:
-    """Provides 'contrastive_loss' an enclosing scope with variable 'margin'.
+def pre_loss(vects: tuple[keras.KerasTensor, keras.KerasTensor, keras.KerasTensor]) -> Any:
+    x, y, z = vects
 
-    Arguments:
-        margin: Integer, defines the baseline for distance for which pairs
-                should be classified as dissimilar. - (default is 1).
+    same_dist = euclidean_distance(x, y)
+    diff_dist = ops.minimum(
+        euclidean_distance(x, z),
+        MARGIN,
+    )
+    output = ops.concatenate((same_dist, diff_dist), 1)
+    return output
 
-    Returns:
-        'contrastive_loss' function with data ('margin') attached.
-    """
 
-    # Contrastive loss = mean( (1-true_value) * square(prediction) +
-    #                         true_value * square( max(margin-prediction, 0) ))
-    def contrastive_loss(
-            y_true: npt.NDArray[np.float32],
-            y_pred: npt.NDArray[np.float32]
-            ) -> Any:
-        """Calculates the contrastive loss.
+def get_song_encodings(filename: str, batch_size: int = 64) -> npt.NDArray[np.float32]:
+    spectrogram = load_data(
+        filename, SPECTROGRAM_NPERSEG, SPECTROGRAM_FRAME_GROUPING
+        ).astype(np.float32)
 
-        Arguments:
-            y_true: List of labels, each label is of type float32.
-            y_pred: List of predictions of same length as of y_true,
-                    each label is of type float32.
+    end_idx = spectrogram.shape[1]-IMAGE_WIDTH
+    preds = np.empty((end_idx, LATENT_SPACE), dtype=np.float32)
 
-        Returns:
-            A tensor containing contrastive loss as floating point value.
-        """
+    for idx in range(0, end_idx, batch_size):
+        curr_end_idx = min(idx+batch_size, end_idx)
+        batch = [
+            spectrogram[:, i:i+IMAGE_WIDTH]
+            for i in range(idx, curr_end_idx)
+        ]
 
-        square_pred = ops.square(y_pred)
-        margin_square = ops.square(ops.maximum(margin - (y_pred), 0))
-        return ops.mean((1 - y_true) * square_pred + (y_true) * margin_square)
+        new_preds = embedded_model.predict(
+            np.array(batch),
+            verbose=0,
+        )
 
-    return contrastive_loss
+        preds[idx:curr_end_idx] = new_preds
+
+    return preds
+
+
+
+def build_embedded_network(model_name: str = 'embedding_network') -> keras.Model:
+    embedding_network = keras.Sequential(
+        [
+            keras.layers.Input((*IMAGE_SIZE, 1)),
+            keras.layers.BatchNormalization(),
+
+            keras.layers.Conv2D(4, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
+            keras.layers.MaxPooling2D(pool_size=(2, 3)),
+            keras.layers.Dropout(0.1),
+
+            keras.layers.Conv2D(8, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
+            keras.layers.MaxPooling2D(pool_size=(1, 2)),
+            keras.layers.Dropout(0.1),
+
+            keras.layers.Conv2D(16, (5, 7), activation=keras.layers.LeakyReLU(0.1)),
+            keras.layers.MaxPooling2D(pool_size=(1, 2)),
+            keras.layers.Dropout(0.1),
+
+            keras.layers.Conv2D(24, (5, 5), strides=(2,2), activation=keras.layers.LeakyReLU(0.1)),
+            keras.layers.MaxPooling2D(pool_size=(2, 2)),
+            keras.layers.Dropout(0.2),
+
+            keras.layers.Flatten(),
+            keras.layers.BatchNormalization(),
+
+            keras.layers.Dense(250, activation=keras.layers.LeakyReLU(0.1)),
+            keras.layers.Dropout(0.3),
+            keras.layers.Dense(200, activation=keras.layers.LeakyReLU(0.1)),
+            keras.layers.Dropout(0.3),
+            keras.layers.Dense(100, activation="tanh"),
+            keras.layers.Dropout(0.3),
+
+            keras.layers.Dense(LATENT_SPACE, activation="tanh"),
+        ],
+        name=model_name,
+    )
+
+    return embedding_network
+
+
+def build_siamese_model(embedding_network: keras.Model) -> keras.Model:
+    input_1 = keras.layers.Input((*IMAGE_SIZE, 1))
+    input_2 = keras.layers.Input((*IMAGE_SIZE, 1))
+    input_3 = keras.layers.Input((*IMAGE_SIZE, 1))
+
+    # As mentioned above, Siamese Network share weights between
+    # tower networks (sister networks). To allow this, we will use
+    # same embedding network for both tower networks.
+    tower_1 = embedding_network(input_1)
+    tower_2 = embedding_network(input_2)
+    tower_3 = embedding_network(input_3)
+
+    output_layer = keras.layers.Lambda(pre_loss, output_shape=(1,))(
+        [tower_1, tower_2, tower_3]
+    )
+    # normal_layer = keras.layers.BatchNormalization()(merge_layer)
+    # output_layer = keras.layers.Dense(1, activation="sigmoid")(normal_layer)
+    siamese = keras.Model(inputs=[input_1, input_2, input_3], outputs=output_layer)
+
+    return siamese
 
 
 
 print('preparing data')
 input_filepaths = get_audio_files(AUDIO_FOLDER)
-# from scipy.io import wavfile
-# illegal_files = [
-#     f
-#     for f in input_filepaths
-#     if wavfile.read(f)[0] != EXPECTED_BITRATE
-# ]
+
 random.shuffle(input_filepaths)
-# input_filepaths = input_filepaths[:10]
+
 max_test = min(
     int(len(input_filepaths)*(1-TRAIN_TEST_SPLIT)),
-    20
+    20,
 )
+
 test_filepaths = input_filepaths[:max_test]
-train_filepaths = [fpath for fpath in input_filepaths if fpath not in test_filepaths]
+train_filepaths = input_filepaths[max_test:]
+
 
 train_data = DataGenerator(
     train_filepaths,
@@ -207,121 +249,78 @@ test_data = DataGenerator(
 )
 
 
-def build_embedded_network(model_name: str = 'embedding_network') -> keras.Model:
-    embedding_network = keras.Sequential([
-        keras.layers.Input((*IMAGE_SIZE, 1)),
-        keras.layers.BatchNormalization(),
 
-        keras.layers.Conv2D(4, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
-        keras.layers.MaxPooling2D(pool_size=(2, 3)),
-        keras.layers.Dropout(0.1),
+embedded_model: keras.Model
+if LOAD_FROM_FILE is None:
+    embedding_network = build_embedded_network()
+    siamese = build_siamese_model(embedding_network)
 
-        keras.layers.Conv2D(8, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
-        keras.layers.MaxPooling2D(pool_size=(1, 2)),
-        keras.layers.Dropout(0.1),
-
-        keras.layers.Conv2D(16, (5, 7), activation=keras.layers.LeakyReLU(0.1)),
-        keras.layers.MaxPooling2D(pool_size=(1, 2)),
-        keras.layers.Dropout(0.1),
-
-        keras.layers.Conv2D(24, (5, 5), activation=keras.layers.LeakyReLU(0.1)),
-        keras.layers.MaxPooling2D(pool_size=(2, 2)),
-        keras.layers.Dropout(0.2),
-
-        keras.layers.Flatten(),
-        keras.layers.BatchNormalization(),
-
-        keras.layers.Dense(250, activation=keras.layers.LeakyReLU(0.1)),
-        keras.layers.Dropout(0.3),
-        keras.layers.Dense(200, activation=keras.layers.LeakyReLU(0.1)),
-        keras.layers.Dropout(0.3),
-        keras.layers.Dense(100, activation="tanh"),
-        keras.layers.Dropout(0.3),
-
-        keras.layers.Dense(LATENT_SPACE, activation="tanh"),
-    ])
-
-    return embedding_network
+    siamese.compile(loss=keras.losses.MeanSquaredError(), optimizer="RMSprop", metrics=["accuracy"])
+    siamese.summary()
+    embedding_network.summary()
 
 
-def build_siamese_model(embedding_network: keras.Model) -> keras.Model:
-    input_1 = keras.layers.Input((*IMAGE_SIZE, 1))
-    input_2 = keras.layers.Input((*IMAGE_SIZE, 1))
+    print()
+    print('training on', len(train_filepaths), 'songs')
+    print('testing on', len(test_filepaths), 'songs')
+    print()
 
-    # As mentioned above, Siamese Network share weights between
-    # tower networks (sister networks). To allow this, we will use
-    # same embedding network for both tower networks.
-    tower_1 = embedding_network(input_1)
-    tower_2 = embedding_network(input_2)
-
-    merge_layer = keras.layers.Lambda(euclidean_distance, output_shape=(1,))(
-        [tower_1, tower_2]
+    checkpoint = keras.callbacks.ModelCheckpoint('checkpoint_{epoch:02d}.keras', save_freq='epoch')
+    history = siamese.fit(
+        x=train_data,
+        validation_data=test_data,
+        batch_size=BATCH_SIZE,
+        steps_per_epoch=STEPS_PER_EPOCH,
+        validation_steps=300,
+        epochs=EPOCHS,
+        shuffle=False,
+        callbacks=[checkpoint],
     )
-    normal_layer = keras.layers.BatchNormalization()(merge_layer)
-    output_layer = keras.layers.Dense(1, activation="sigmoid")(normal_layer)
-    siamese = keras.Model(inputs=[input_1, input_2], outputs=output_layer)
 
-    return siamese
+    embedded_layer = siamese.get_layer('embedding_network')
+    embedded_model = keras.Model(inputs = embedded_layer.input, outputs = embedded_layer.output)
 
-
-embedding_network = build_embedded_network()
-siamese = build_siamese_model(embedding_network)
-
-siamese.compile(loss=keras.losses.MeanSquaredError(), optimizer="RMSprop", metrics=["accuracy"])
-siamese.summary()
-embedding_network.summary()
+    embedded_model.save('out.keras')
+else:
+    embedded_model = keras.saving.load_model(LOAD_FROM_FILE)
 
 
-"""
-## Train the model
-"""
+all_filepaths = test_filepaths[:80] + train_filepaths[:20]
 
-print()
-print('training on', len(train_filepaths), 'songs')
-print('testing on', len(test_filepaths), 'songs')
-print()
+encodings = {}
 
-checkpoint = keras.callbacks.ModelCheckpoint('checkpoint_{epoch:02d}.keras', save_freq='epoch')
-history = siamese.fit(
-    x=train_data,
-    validation_data=test_data,
-    batch_size=BATCH_SIZE,
-    steps_per_epoch=STEPS_PER_EPOCH,
-    validation_steps=300,
-    epochs=EPOCHS,
-    shuffle=False,
-    callbacks=[checkpoint],
-)
-
-siamese.save('out.keras')
-
+for i, filename in enumerate(all_filepaths):
+    print(f'{100*i/len(all_filepaths): >6.2f}%', end='\b'*7, flush=True)
+    encodings[filename] = get_song_encodings(filename, 400)
 
 a = i_am_confusion(
-    siamese,
+    encodings,
     test_filepaths[:20],
-    config,
-    batch_size=400,
     samples_per_song=3000,
 )
 print()
 print("test confusion")
-print_matrix(a[0])
+print_matrix(a, 'avg_from_mean')
 print()
 print()
-print("test confidence")
-print_matrix(a[1])
-print()
-print()
+
 b = i_am_confusion(
-    siamese,
+    encodings,
     train_filepaths[:20],
-    config,
-    batch_size=400,
     samples_per_song=3000,
 )
 print("train confusion")
-print_matrix(b[0])
+print_matrix(b, 'avg_from_mean')
+
 print()
 print()
-print("train confidence")
-print_matrix(b[1])
+
+c = i_am_confusion(
+    encodings,
+    all_filepaths,
+    samples_per_song=1500,
+)
+print("similarity matrix")
+print_matrix(c, 'dist_mean')
+
+

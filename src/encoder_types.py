@@ -4,7 +4,7 @@ import numpy as np
 import numpy.typing as npt
 
 Image_Type: TypeAlias = npt.NDArray[np.float32]
-Raw_Data_Point_Type: TypeAlias = tuple[tuple[Image_Type, Image_Type], int]
+Raw_Data_Point_Type: TypeAlias = tuple[Image_Type, Image_Type, Image_Type]
 
 class Config_Type(TypedDict):
     AUDIO_FOLDER: str
